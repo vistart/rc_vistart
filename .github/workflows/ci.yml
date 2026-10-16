@@ -31,9 +31,13 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
+          # The module has no third-party dependencies, so there is no go.sum
+          # for the default cache key to hash. Keying on go.mod removes the
+          # warning and stays correct if a dependency is ever added.
+          cache-dependency-path: go.mod
 
-      # gofmt is the formatter of record, so a formatting drift is a failure
-      # rather than something a reviewer has to notice.
+      # gofmt is the formatter of record, so a formatting drift fails the build
+      # rather than relying on a reviewer to notice it.
       - name: gofmt
         run: |
           unformatted="$(gofmt -s -l .)"
@@ -55,6 +59,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.mod
 
       # The race detector runs here rather than on a developer machine because
       # it needs CGO and a supported C compiler; Linux CI always has both.
@@ -79,12 +84,13 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.mod
 
       # The scenarios assert their expectations and exit non-zero on failure,
       # so this is an end-to-end check of the delivery contract rather than a
-      # demonstration. It covers the paths unit tests cannot: real HTTP between
-      # the service and a simulated destination, retries, deduplication,
-      # result deadlines and escalation.
+      # demonstration. It covers what unit tests cannot: real HTTP between the
+      # service and a simulated destination, retries, deduplication, result
+      # deadlines and escalation.
       - name: Run scenarios
         run: go run ./cmd/demo -v
 
@@ -97,6 +103,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.mod
 
       # Compile for every platform we publish binaries for, so a cross-platform
       # mistake fails here instead of at release time.
