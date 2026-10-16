@@ -1,5 +1,7 @@
 # rc_vistart
 
+[English](README.md) | [简体中文](README.zh-cn.md)
+
 > **TODO — project description.** This section is a placeholder and will be
 > replaced with the official introduction once it is provided.
 
@@ -20,6 +22,10 @@ No third-party dependencies — only the Go standard library.
 - [Demo scenarios](#demo-scenarios)
 - [Architecture](#architecture)
 - [The delivery guarantee](#the-delivery-guarantee)
+- [Design decisions](#design-decisions)
+  - [System boundary](#system-boundary)
+  - [Reliability and failure handling](#reliability-and-failure-handling)
+  - [Trade-offs and evolution](#trade-offs-and-evolution)
 - [Orders and steps](#orders-and-steps)
 - [Registering a destination](#registering-a-destination)
 - [HTTP API](#http-api)
@@ -174,6 +180,135 @@ sequenceDiagram
 
 Losing a notification is treated as the worse failure, because a duplicate
 notice is recoverable downstream and a dropped one is not.
+
+## Design decisions
+
+This chapter is the reasoning behind the system: what it is responsible for,
+what it deliberately is not, and what would have to change as it grows.
+
+### System boundary
+
+**What this system takes responsibility for:**
+
+- Accepting an order and holding its step graph, fixed at creation.
+- Delivering each step to the destination registered for it, at least once.
+- Knowing when a step is finished — an acknowledgement, or a posted result.
+- Retrying transient failures and escalating what will not land.
+- Recording every attempt, so a dropped or repeated notification is visible.
+- Shaping the request per destination, since URL, headers and body differ.
+
+**What this system explicitly does not do, and why:**
+
+| Not solved here             | Why                                                                                                                          |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| Business truth              | `rc_vistart` does not know whether stock exists, only whether the destination said so. Business rules belong in the business service; duplicating them here would create a second source of truth that silently drifts. |
+| Receiver-side deduplication | Only the receiver can distinguish a retry from new work without trusting the sender. We supply a stable key and make deduplication possible. We cannot enforce it. |
+| Exactly-once delivery       | Not achievable over HTTP without a distributed transaction. Claiming it would hide the problem rather than solve it.           |
+| Destination availability     | We retry and escalate. We do not make a downstream service healthy. That is the destination's problem to own.                |
+| Translating vendor schemas   | Templates let each destination own its own request format. A central mapping layer would put every third-party schema in this repository. |
+| Fan-out to many destinations | One topic maps to exactly one destination. A destination needing the same event in three places is modelled as three steps, which keeps delivery and accounting per destination. |
+| Long-term history            | An order here is an operational record, not a data warehouse. Retention and analytics belong elsewhere.                     |
+| Service-to-service auth      | The result endpoint matches a delivery id; it does not authenticate. Deliberate prototype simplification, and the first thing to fix. |
+
+### Reliability and failure handling
+
+**Delivery semantics: at-least-once per task, with a stable task key and receiver-side deduplication.**
+
+- Not **at-most-once**: a dropped notification is unrecoverable business damage,
+  while a duplicate is recoverable downstream. The asymmetry decides it.
+- Not **exactly-once**: it needs a distributed transaction that HTTP cannot
+  provide. It could be *approximated* with deduplication plus a two-phase
+  handshake, but that is a considerably larger system and still not a guarantee.
+
+**Failures are classified before anything is retried**, because retrying a
+request that cannot succeed only burns time and hides the real error:
+
+| Failure                                | Treatment                                                                  |
+| -------------------------------------- | ------------------------------------------------------------------------- |
+| Network error, timeout, `5xx`, `429`   | Retry with exponential backoff, up to `max_attempts`.                     |
+| Result not posted within the deadline  | Counted as a failed attempt and retried. This is "we never heard back".   |
+| `4xx`, redirect                        | Escalate at once. The request is wrong; a repeat will be wrong too.       |
+| Template cannot be rendered            | Escalate at once, and registration now rejects it up front.               |
+| No endpoint registered for the topic   | Retry, then escalate. The destination may still register.                |
+
+**When an external system fails or stays unavailable for a long time:**
+
+1. Each endpoint carries its own attempt budget and backoff bounds, so one
+   destination's behaviour cannot change another's.
+2. On exhaustion the step becomes `escalated`, the order fails, and dependent
+   steps are `skipped` — never left waiting.
+3. The task appears in `/api/v1/escalations` and is logged at `ERROR` with its
+   task key. That list is the operator's work queue.
+4. The destination can recover at any time by re-registering: registration
+   replaces the endpoint in place and keeps its id, so subsequent orders flow
+   normally with no operator action.
+
+The honest gap: **an escalated task is not replayed automatically when the
+destination comes back.** Today a human works the escalation list. If a
+destination is down for an hour, every order in that window escalates and each
+one needs manual handling. Automatic replay, scoped by topic and time window,
+is the most likely next feature — the task key makes a replay safe, because the
+receiver will deduplicate the repeat.
+
+**What is not protected against:** losing in-flight work on a process crash,
+since nothing is persisted; and clock skew, since replay windows are evaluated
+by the receiver using the timestamps we send.
+
+### Trade-offs and evolution
+
+**Rejected as over-engineering at this stage.** Each of these is a defensible
+production answer that would have cost more than it returned for a prototype
+with no measured load:
+
+- **A message backbone such as Kafka.** We already need a queue, but adopting a
+  broker adds operational surface and, more importantly, a new failure mode —
+  the broker — before there is volume to justify it. The in-process queue is
+  inspectable, which is worth a lot while the design is still moving.
+- **A transactional outbox with a relational database.** This is the right
+  answer at production volume. It also presupposes a database, and the durable
+  store is the *first* thing to add when durability is actually required, not
+  the first thing to build.
+- **gRPC or protobuf with a schema registry.** The destinations are third-party
+  and mostly HTTP-shaped. A proto contract would not be adopted by an inventory
+  team, so it would be a second contract nobody uses.
+- **Circuit breakers, bulkheads and per-destination rate limits.** A genuine
+  need (see below), but adding them before the failure has been observed is
+  speculative. Named here as the first thing to add *when it happens*.
+- **A dead-letter queue with a replay API.** The escalation list is already that
+  queue, minus replay. Building the replay workflow properly is worth doing once
+  replay is a real operational task rather than a guess.
+- **OpenTelemetry and distributed tracing from day one.** The task key already
+  correlates an order, its steps and its attempts end to end, which is most of
+  the benefit at none of the cost.
+- **Event sourcing or CQRS.** The order is already an append-friendly record
+  with a per-step ledger. Full event sourcing would add replay machinery that
+  nothing currently needs.
+- **Multi-region active-active, Helm charts, Terraform, service mesh.** None of
+  this is a design decision about delivery, and it presumes infrastructure
+  choices the team may not have made.
+- **An authentication and authorisation framework.** For one internal service
+  the first step is a shared secret per registration, not a framework.
+
+**Simplifications worth naming.** The two-pass template render exists so a
+header can sign the body, which only one destination needs — kept because it is
+about twenty lines and is validated at registration. Cycle detection is a
+three-colour depth-first search rather than a graph library, which is fine at
+this size and will stay fine as it grows.
+
+**What would have to change, and the signal that it is time.** Ordered by how
+likely each is to bite:
+
+| Signal                                                       | Change                                                                     |
+| ------------------------------------------------------------ | -------------------------------------------------------------------------- |
+| A slow destination holds workers                             | Per-destination concurrency limits and a circuit breaker. **This is the most likely first incident:** the worker pool is global, so one slow destination can occupy every worker for its full timeout and stall unrelated orders. |
+| Many orders fail at the same instant                        | Jitter the backoff. It is currently deterministic, so retries align.        |
+| A restart must not lose orders                              | Durable order store and durable queue. `notify.Registry` and the engine's order map are the seams. |
+| Escalations must be worked off automatically                 | Replay scoped by topic and time window; the stable task key keeps it safe.  |
+| Memory grows with traffic                                    | Retention policy for terminal orders, with the ledger moved to durable storage. Today both the orders map and the escalation list grow without bound. |
+| A topic needs more than one destination                      | Multi-endpoint topics, or model it as additional steps as now.              |
+| Pending tasks reach the tens of thousands                    | Replace the sorted slice with a heap.                                       |
+| Destinations need caller-specific budgets                   | Per-registration rate limits.                                               |
+| Third-party destinations need authenticated callbacks        | Per-service credentials or mTLS on the result endpoint.                      |
 
 ## Orders and steps
 
@@ -527,19 +662,19 @@ internal/version/     Build metadata injected via -ldflags
 
 ## Prototype limitations
 
-Stated plainly, because the design is otherwise easy to over-read:
+Stated plainly, because the design is otherwise easy to over-read. The
+reasoning behind each is in [Design decisions](#design-decisions).
 
 - **State is in memory.** Endpoint registrations, orders and the queue are lost
-  on restart. A production version needs durable storage for all three; the
-  `notify.Registry` interface and the engine's order store are where it would
-  plug in.
+  on restart, and in-flight deliveries are not resumed.
 - **The step result endpoint is unauthenticated** beyond matching the delivery
-  id. A real deployment needs per-service credentials or mTLS.
-- **Escalation is a log line and an API view**, not a page.
-- **The queue is a sorted slice**, fine for thousands of pending tasks, not
-  millions.
-- **`rc_vistart` does not resume interrupted deliveries** after a restart, which
-  follows from the first point.
+  id.
+- **Escalation is a log line and an API view**, not a page, and escalated tasks
+  are not replayed automatically.
+- **No per-destination isolation.** One slow destination can hold every worker.
+- **The backoff has no jitter**, so simultaneous failures retry in lockstep.
+- **The queue is a sorted slice** and the order and escalation stores are
+  unbounded, which is fine at thousands and not at millions.
 - **Deduplication is the destination's job.** The service makes it possible by
   keeping the task key stable; it cannot enforce it.
 
