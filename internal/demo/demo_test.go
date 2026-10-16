@@ -9,12 +9,14 @@ import (
 // TestScenarios runs every demo scenario as a test, so `go test ./...` covers
 // the reliability claims the demos make. `make demo` runs the same code and
 // prints the report.
+//
+// Scenarios run one at a time. Each starts a service, several destinations and
+// a pool of delivery workers, so running six of them at once on a two-core
+// runner adds contention that has nothing to do with what is being tested.
 func TestScenarios(t *testing.T) {
 	for _, scenario := range Scenarios() {
 		t.Run(scenario.Name, func(t *testing.T) {
-			t.Parallel()
-
-			env := NewEnv(false)
+			env := NewEnv()
 			defer env.Close()
 
 			result, err := scenario.Run(env)
@@ -82,7 +84,7 @@ func TestLookup(t *testing.T) {
 }
 
 func TestEnvSetPublicURLBuildsResultURLs(t *testing.T) {
-	env := NewEnv(false)
+	env := NewEnv()
 	defer env.Close()
 
 	if got, want := env.BaseURL, env.Engine.ResultURL("ord_1", "step_a"); !strings.HasPrefix(want, got) {
@@ -94,7 +96,7 @@ func TestEnvSetPublicURLBuildsResultURLs(t *testing.T) {
 }
 
 func TestWaitForReportsFailure(t *testing.T) {
-	env := NewEnv(false)
+	env := NewEnv()
 	defer env.Close()
 
 	// A condition that never holds must time out rather than hang forever.
@@ -108,7 +110,7 @@ func TestWaitForReportsFailure(t *testing.T) {
 }
 
 func TestSubmitRejectsDuplicateOrder(t *testing.T) {
-	env := NewEnv(false)
+	env := NewEnv()
 	defer env.Close()
 
 	spec := map[string]any{

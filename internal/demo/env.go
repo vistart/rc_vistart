@@ -113,14 +113,21 @@ type Env struct {
 	logger *slog.Logger
 }
 
+// defaultResultTimeout is generous on purpose. Most scenarios are not testing
+// the result deadline, and a mock that answers promptly must not turn a busy
+// machine — or the race detector, which is roughly an order of magnitude
+// slower — into a spurious retry. A scenario that deliberately exercises the
+// deadline sets its own short value.
+const defaultResultTimeout = 60 * time.Second
+
 // NewEnv starts rc_vistart on an ephemeral port with an in-memory registry.
-func NewEnv(verbose bool) *Env {
+//
+// Logs are always captured at info level into a buffer that is only printed
+// when something fails, so a failing scenario reports what the destinations
+// actually saw rather than just the engine's warnings.
+func NewEnv() *Env {
 	logBuf := &bytes.Buffer{}
-	var level slog.Level = slog.LevelWarn
-	if verbose {
-		level = slog.LevelInfo
-	}
-	logger := slog.New(slog.NewTextHandler(logBuf, &slog.HandlerOptions{Level: level}))
+	logger := slog.New(slog.NewTextHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	registry := notify.NewMemoryRegistry()
 	stats := notify.NewStats()
@@ -185,6 +192,9 @@ func (e *Env) AddMock(cfg mockservice.Config) *mockservice.Mock {
 	cfg.Target = e.BaseURL
 	if cfg.Logger == nil {
 		cfg.Logger = e.logger
+	}
+	if cfg.ResultTimeout <= 0 {
+		cfg.ResultTimeout = defaultResultTimeout
 	}
 
 	m, err := mockservice.New(cfg)

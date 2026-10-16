@@ -84,13 +84,16 @@ func main() {
 		if !result.Passed {
 			verdict = "FAIL"
 			failed++
-			if result.Log != "" {
-				fmt.Printf("\n  service log:\n%s\n", indent(result.Log, "    "))
-			}
 		} else {
 			passed++
 		}
 		fmt.Printf("\n  %s  %s (%s)\n", verdict, result.Name, result.Duration.Round(time.Millisecond))
+
+		// A failing scenario always explains itself; -v shows the log either
+		// way, which is what makes a surprising pass investigable.
+		if (*verbose || !result.Passed) && result.Log != "" {
+			fmt.Printf("\n  service log:\n%s\n", indent(result.Log, "    "))
+		}
 	}
 
 	fmt.Println()
@@ -102,7 +105,7 @@ func main() {
 }
 
 func run(scenario demo.Scenario, verbose bool) demo.Result {
-	env := demo.NewEnv(verbose)
+	env := demo.NewEnv()
 	defer env.Close()
 
 	result, err := scenario.Run(env)
@@ -116,9 +119,6 @@ func run(scenario demo.Scenario, verbose bool) demo.Result {
 		}
 	}
 	result.Log = env.Logs()
-	if verbose {
-		result.Log = env.Logs()
-	}
 	return result
 }
 
