@@ -520,10 +520,17 @@ func (e *Engine) backoffFor(topic string, attempt int) time.Duration {
 func (e *Engine) snapshotLocked(o *Order) *Order {
 	out := *o
 	out.Steps = make([]*Step, len(o.Steps))
+	// The name index must point at the clones. Copying the map by reference
+	// would leave Step() handing out pointers to the live steps, which a
+	// caller could then read with the lock released.
+	out.byName = make(map[string]*Step, len(o.Steps))
+
 	for i, s := range o.Steps {
 		clone := *s
 		clone.Deliveries = append([]Delivery(nil), s.Deliveries...)
+		clone.Result = append(json.RawMessage(nil), s.Result...)
 		out.Steps[i] = &clone
+		out.byName[s.Spec.Name] = &clone
 	}
 	return &out
 }

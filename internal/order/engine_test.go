@@ -711,6 +711,51 @@ func TestFailedPrepareStepSkipsTheRest(t *testing.T) {
 	}
 }
 
+func TestSnapshotLookupIsIsolatedFromTheEngine(t *testing.T) {
+	// A snapshot must be a real snapshot. Reaching it through Step() used to
+	// hand back a pointer into the engine's live step, so a caller could read
+	// or write engine state with the lock released. That is a data race, and
+	// this catches it without needing the race detector.
+	h := newHarness(t, &stubInvoker{})
+	h.register(t, "svc", "act", 3)
+
+	if _, err := h.engine.Submit(Spec{ID: "ord_1", Steps: singleStepSpec(KindNotify, "svc.act")}); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+
+	snapshot, err := h.engine.Get("ord_1")
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+
+	viaLookup, err := snapshot.Step("only")
+	if err != nil {
+		t.Fatalf("Step() error = %v", err)
+	}
+	viaSlice, err := snapshot.Step("only")
+	if err != nil {
+		t.Fatalf("second Step() error = %v", err)
+	}
+	if viaLookup != viaSlice {
+		t.Error("Step() returned different steps on the same snapshot")
+	}
+
+	// Mutating what the lookup handed back must not reach the engine.
+	viaLookup.State = StateEscalated
+	viaLookup.Attempts = 99
+
+	fresh, err := h.engine.Get("ord_1")
+	if err != nil {
+		t.Fatalf("second Get() error = %v", err)
+	}
+	if fresh.Steps[0].State == StateEscalated {
+		t.Error("mutating a snapshot step reached the engine's live state")
+	}
+	if fresh.Steps[0].Attempts == 99 {
+		t.Error("mutating a snapshot step's attempt count reached the engine")
+	}
+}
+
 func TestListAndGetReturnCopies(t *testing.T) {
 	h := newHarness(t, &stubInvoker{})
 	h.register(t, "svc", "act", 3)

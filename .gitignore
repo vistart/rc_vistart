@@ -1,8 +1,10 @@
-# Build output
+# Build output. The binary patterns are anchored to the repository root on
+# purpose: unanchored, "rc_vistart" also matches the cmd/rc_vistart package
+# directory and silently drops the service's main package from the repository.
 /bin/
 /dist/
-rc_vistart
-rc_vistart.exe
+/rc_vistart
+/rc_vistart.exe
 
 # Test and coverage output
 *.test
