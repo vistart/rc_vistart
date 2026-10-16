@@ -732,16 +732,18 @@ func TestResultArrivingBeforeTheResponseWins(t *testing.T) {
 	// back into waiting, never complete, and be retried once its deadline
 	// passed. The result is the stronger signal, so it must win.
 	registry := notify.NewMemoryRegistry()
-	engine := NewEngine(registry, nil, notify.NewStats(), Config{
+	// The invoker is created before the engine and back-references it, then is
+	// completed before any worker starts. Assigning engine.invoker after Start
+	// would itself be a race with the workers reading it.
+	inv := &eagerInvoker{orderID: "ord_eager", step: "reserve"}
+	engine := NewEngine(registry, inv, notify.NewStats(), Config{
 		Workers:      2,
 		PollInterval: 5 * time.Millisecond,
 		PublicURL:    "http://rc.test",
 	}, quietLogger())
+	inv.engine = engine
 	engine.Start()
 	defer engine.Stop()
-
-	inv := &eagerInvoker{engine: engine, orderID: "ord_eager", step: "reserve"}
-	engine.invoker = inv
 
 	if _, err := registry.Register(notify.Endpoint{
 		Service:       "inventory",
@@ -794,6 +796,95 @@ func TestResultArrivingBeforeTheResponseWins(t *testing.T) {
 	}
 	if len(engine.Escalations()) != 0 {
 		t.Errorf("escalations = %d, want 0", len(engine.Escalations()))
+	}
+}
+
+func TestResultBeforeResponseStillRecordsTheAttempt(t *testing.T) {
+	// The audit trail must account for every attempt, whichever of the two
+	// signals arrives first. When the result wins the race, the ledger entry
+	// has to be written by the result path.
+	h := newHarness(t, &stubInvoker{})
+	h.register(t, "svc", "act", 3)
+
+	if _, err := h.engine.Submit(Spec{ID: "ord_1", Steps: []StepSpec{{
+		Name:  "only",
+		Phase: PhasePrepare,
+		Kind:  KindCallback,
+		Topic: "svc.act",
+	}}}); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+	waitFor(t, "the step to await a result", func() bool {
+		return h.stepState(t, "ord_1", "only") == StateWaiting
+	})
+
+	o, _ := h.engine.Get("ord_1")
+	s, _ := o.Step("only")
+	deliveryID := s.PendingDeliveryID
+
+	// The ordinary ordering: the response has already been recorded.
+	if len(s.Deliveries) != 1 {
+		t.Fatalf("ledger has %d entries before the result, want 1", len(s.Deliveries))
+	}
+
+	if _, err := h.engine.SubmitResult("ord_1", "only", deliveryID, true, nil); err != nil {
+		t.Fatalf("SubmitResult() error = %v", err)
+	}
+
+	after, _ := h.engine.Get("ord_1")
+	done, _ := after.Step("only")
+	if len(done.Deliveries) != 1 {
+		t.Errorf("ledger has %d entries, want 1: a result must not double-record its delivery", len(done.Deliveries))
+	}
+
+	// The reversed ordering: the result arrives before the response is applied.
+	registry := notify.NewMemoryRegistry()
+	inv := &eagerInvoker{orderID: "ord_2", step: "only"}
+	engine := NewEngine(registry, inv, notify.NewStats(), Config{
+		Workers:      2,
+		PollInterval: 5 * time.Millisecond,
+		PublicURL:    "http://rc.test",
+	}, quietLogger())
+	inv.engine = engine
+	engine.Start()
+	defer engine.Stop()
+
+	if _, err := registry.Register(notify.Endpoint{
+		Service:     "svc",
+		Action:      "act",
+		URL:         "http://svc.test/act",
+		MaxAttempts: 3,
+	}); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	if _, err := engine.Submit(Spec{ID: "ord_2", Steps: []StepSpec{{
+		Name:  "only",
+		Phase: PhasePrepare,
+		Kind:  KindCallback,
+		Topic: "svc.act",
+	}}}); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+	waitFor(t, "the eager order to finish", func() bool {
+		o, err := engine.Get("ord_2")
+		if err != nil {
+			return false
+		}
+		s, err := o.Step("only")
+		return err == nil && s.State == StateSucceeded
+	})
+
+	eager, _ := engine.Get("ord_2")
+	step, _ := eager.Step("only")
+	if len(step.Deliveries) != 1 {
+		t.Fatalf("ledger has %d entries, want 1 recorded by the result path", len(step.Deliveries))
+	}
+	if !step.Deliveries[0].FromResult {
+		t.Error("the ledger entry should be marked as coming from the result")
+	}
+	if step.Deliveries[0].DeliveryID == "" {
+		t.Error("the ledger entry has no delivery id")
 	}
 }
 

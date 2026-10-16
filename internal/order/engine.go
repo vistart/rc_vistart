@@ -245,6 +245,24 @@ func (e *Engine) SubmitResult(orderID, stepName, deliveryID string, success bool
 		s.FinishedAt = &now
 		s.LastError = ""
 		s.PendingDeliveryID = ""
+
+		// A receiver may answer before its HTTP response is applied, in which
+		// case this result is what completed the step. Record the attempt here
+		// so the ledger still accounts for it; execute then discards the
+		// redundant response. Without this, an attempt could succeed and leave
+		// no trace in the audit trail.
+		if !s.hasDelivery(deliveryID) {
+			s.Deliveries = append(s.Deliveries, Delivery{
+				Attempt:    s.Attempts,
+				DeliveryID: deliveryID,
+				At:         now,
+				Outcome:    "delivered",
+				FromResult: true,
+			})
+			s.trimLedger()
+			e.stats.RecordDelivered(e.metaFor(s.Spec.Topic), 0)
+		}
+
 		e.logger.Info("step succeeded",
 			slog.String("order_id", orderID),
 			slog.String("step", stepName),
@@ -488,6 +506,20 @@ func (s *Step) trimLedger() {
 	if len(s.Deliveries) > maxLedger {
 		s.Deliveries = s.Deliveries[len(s.Deliveries)-maxLedger:]
 	}
+}
+
+// hasDelivery reports whether this attempt is already in the ledger, so a
+// result that arrives before its own response cannot record it twice.
+func (s *Step) hasDelivery(deliveryID string) bool {
+	if deliveryID == "" {
+		return false
+	}
+	for _, d := range s.Deliveries {
+		if d.DeliveryID == deliveryID {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *Engine) metaFor(topic string) notify.Meta {

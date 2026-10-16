@@ -125,6 +125,10 @@ type Delivery struct {
 	Retryable bool `json:"retryable,omitempty"`
 	// NextAttemptAt is when the retry became due, if it was scheduled.
 	NextAttemptAt *time.Time `json:"next_attempt_at,omitempty"`
+	// FromResult marks an attempt recorded from a posted step result rather
+	// than from the delivery's HTTP response, which happens when a receiver
+	// answers before that response is applied.
+	FromResult bool `json:"from_result,omitempty"`
 }
 
 // maxLedger bounds the per-step delivery history.

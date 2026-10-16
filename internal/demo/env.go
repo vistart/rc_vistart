@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/vistart/rc_vistart/internal/httpapi"
@@ -109,7 +110,7 @@ type Env struct {
 	server *httptest.Server
 	client *http.Client
 	mocks  []*mockservice.Mock
-	logBuf *bytes.Buffer
+	logBuf *syncBuffer
 	logger *slog.Logger
 }
 
@@ -120,13 +121,33 @@ type Env struct {
 // deadline sets its own short value.
 const defaultResultTimeout = 60 * time.Second
 
+// syncBuffer collects log output from the engine's workers and the
+// destinations' goroutines. Reading it while they are still writing is a data
+// race, so every access takes the lock.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // NewEnv starts rc_vistart on an ephemeral port with an in-memory registry.
 //
 // Logs are always captured at info level into a buffer that is only printed
 // when something fails, so a failing scenario reports what the destinations
 // actually saw rather than just the engine's warnings.
 func NewEnv() *Env {
-	logBuf := &bytes.Buffer{}
+	logBuf := &syncBuffer{}
 	logger := slog.New(slog.NewTextHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	registry := notify.NewMemoryRegistry()
