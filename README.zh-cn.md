@@ -2,16 +2,25 @@
 
 [English](README.md) | [简体中文](README.zh-cn.md)
 
-> **TODO — 项目简介。** 本节为占位内容，待正式文案提供后替换。
+[![CI](https://github.com/vistart/rc_vistart/actions/workflows/ci.yml/badge.svg)](https://github.com/vistart/rc_vistart/actions/workflows/ci.yml)
 
-一个内部通知投递服务。业务系统把订单提交给它；它负责通知各业务方注册的接收地址，
-并一直重试，直到每一条通知被确认送达。
+一个面向订单驱动的内部通知投递服务。
 
-- **接收**业务系统提交的订单（一个简洁的 JSON HTTP API）。
-- **投递**订单中的每一个步骤到对应的注册方，失败时退避重试，最终升级告警。
-- **记录**每一次投递尝试，因此事后可以回答"发出去了吗？"和"发了几次？"。
+业务系统提交订单；`rc_vistart` 把订单中的每一个步骤投递到对应注册的接收方，
+一直重试直到被确认，并将始终无法送达的任务升级告警。
 
-无第三方依赖，只使用 Go 标准库。
+它存在的原因，是各个接收方彼此不一致：广告平台、CRM、库存与支付，各有不同的请求
+地址、不同的 HTTP 方法、不同的 Header 与不同的 Body 结构，并且各自认定成功的标准
+也不相同。这些差异不属于业务系统；而如果在每个业务系统里各写一套投递逻辑，就意味
+着要在四个地方同时维护，且没有任何一处会发现通知被悄悄丢掉。
+
+因此：由接收方注册自己希望被如何调用，业务系统只负责提交订单。
+
+- **接收**订单（一个简洁的 JSON HTTP API），可使用内置场景，也可自定义步骤图。
+- **投递**每个步骤至少一次，支持按接收方配置超时、可接受状态码、指数退避与升级。
+- **记录**每一次尝试并形成台账，因此事后可回答"发出去了吗？"与"发了几次？"。
+
+无第三方依赖，只使用 Go 标准库。至于它刻意*不*做的事，见[设计取舍](#设计取舍)。
 
 ## 目录
 
@@ -570,11 +579,14 @@ curl http://localhost:9001/state
 
 ## 开发
 
-本项目没有远程 CI，验证全部在本地完成。
+每次推送到 `main` 以及每个 pull request 都会触发 [GitHub Actions](.github/workflows/ci.yml)：
+`gofmt` 与 `go vet`、带覆盖率且开启竞态检测的 `go test -race`、演示场景，以及面向全部
+受支持平台的交叉编译。相同的检查也可以在本地手工执行。
 
 ```bash
 make check   # gofmt 检查、go vet、测试
 make test    # go test ./...
+make demo    # 端到端场景
 make cover   # 生成 coverage.out 与 coverage.html
 make build   # bin/rc_vistart、bin/mock_service、bin/demo
 make help    # 列出全部目标
@@ -588,13 +600,14 @@ go run ./cmd/demo
 go build -o bin/rc_vistart.exe ./cmd/rc_vistart
 ```
 
-> **关于 `-race`：** `make test-race` 会执行 `go test -race ./...`，需要可用的 race
-> 工具链（CGO 以及受支持的 C 编译器）。在当前的 Windows/mingw 环境下，它会在任何测试
-> 开始之前就因入口点错误而启动失败，因此在工具链修复之前应视为可选项。
+> **关于 `-race`：** CI 会执行 `go test -race ./...`，它需要 CGO 以及受支持的 C 编译器。
+> 在当前的 Windows/mingw 环境下，它会在任何测试开始之前就因入口点错误而启动失败，
+> 因此 `make test-race` 仅适用于工具链支持竞态检测的机器。
 
 ## 项目结构
 
 ```
+.github/workflows/   CI：fmt、vet、竞态测试、演示场景、交叉编译
 cmd/rc_vistart/       服务入口、装配与优雅退出
 cmd/mock_service/     internal/mockservice 的命令行封装
 cmd/demo/             演示运行器：输出报告，失败时以非零码退出

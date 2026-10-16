@@ -2,20 +2,34 @@
 
 [English](README.md) | [简体中文](README.zh-cn.md)
 
-> **TODO — project description.** This section is a placeholder and will be
-> replaced with the official introduction once it is provided.
+[![CI](https://github.com/vistart/rc_vistart/actions/workflows/ci.yml/badge.svg)](https://github.com/vistart/rc_vistart/actions/workflows/ci.yml)
 
-An internal delivery service. Business systems submit orders to it; it notifies
-the downstream endpoints those systems registered, and keeps trying until each
-notification is acknowledged.
+An internal delivery service for order-driven notifications.
 
-- **Accepts** order submissions over a small JSON HTTP API.
-- **Delivers** each step of an order to the destination registered for it,
-  retrying with backoff and escalating whatever never lands.
-- **Tracks** every attempt, so "did we send it?" and "did we send it twice?"
-  are both answerable after the fact.
+Business systems submit an order; `rc_vistart` delivers each step of that order
+to the downstream service that registered for it, retries until acknowledged,
+and escalates whatever never lands.
 
-No third-party dependencies — only the Go standard library.
+It exists because the destinations disagree. An ad network, a CRM, an inventory
+service and a payment provider each want a different URL, a different HTTP
+method, a different set of headers and a different body shape — and each
+decides for itself what counts as success. None of that belongs in the business
+services, and reimplementing the delivery logic in each of them means
+maintaining it in four places at once, none of them watching for a lost
+notification.
+
+So each destination registers how it wants to be called, and the business
+systems only submit orders.
+
+- **Accepts** orders over a small JSON HTTP API, as a built-in scenario or a
+  caller-supplied step graph.
+- **Delivers** every step at least once, with per-destination timeouts,
+  expected status codes, exponential backoff and escalation.
+- **Tracks** every attempt in a ledger, so "did we send it?" and "did we send
+  it twice?" are both answerable afterwards.
+
+No third-party dependencies — only the Go standard library. For what it
+deliberately does *not* do, see [Design decisions](#design-decisions).
 
 ## Contents
 
@@ -622,11 +636,15 @@ curl http://localhost:9001/state
 
 ## Development
 
-There is no remote CI for this project — verification is local.
+Verification runs on every push to `main` and every pull request, via
+[GitHub Actions](.github/workflows/ci.yml): `gofmt` and `go vet`, `go test
+-race` with coverage, the demo scenarios, and a cross-compile for all supported
+platforms. The same checks can be run by hand.
 
 ```bash
 make check   # gofmt check, go vet, tests
 make test    # go test ./...
+make demo    # the end-to-end scenarios
 make cover   # coverage.out + coverage.html
 make build   # bin/rc_vistart, bin/mock_service, bin/demo
 make help    # list every target
@@ -640,14 +658,15 @@ go run ./cmd/demo
 go build -o bin/rc_vistart.exe ./cmd/rc_vistart
 ```
 
-> **Note on `-race`:** `make test-race` runs `go test -race ./...`, which needs a
-> working race-enabled toolchain (CGO plus a supported C compiler). On the
-> current Windows/mingw setup it fails to start with an entry-point error before
-> any test runs, so treat it as optional until the toolchain is fixed.
+> **Note on `-race`:** CI runs `go test -race ./...`, which needs CGO and a
+> supported C compiler. Locally on the current Windows/mingw setup it fails to
+> start with an entry-point error before any test runs, so `make test-race` is
+> for a machine whose toolchain supports it.
 
 ## Project layout
 
 ```
+.github/workflows/   CI: fmt, vet, race tests, demo scenarios, cross-compile
 cmd/rc_vistart/       Service entry point, wiring and graceful shutdown
 cmd/mock_service/     CLI around internal/mockservice
 cmd/demo/             Demo runner: reports, and exits non-zero on failure

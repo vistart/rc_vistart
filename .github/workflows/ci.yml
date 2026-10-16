@@ -1,0 +1,124 @@
+name: CI
+
+# Only Go 1.27 is supported, so the toolchain is pinned in one place rather
+# than run as a matrix. Raising it is a deliberate change, not a side effect of
+# a dependency update.
+env:
+  GO_VERSION: "1.27"
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A newer push to the same branch makes an in-flight run irrelevant.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# The workflow only needs to read the repository.
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Format and vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # gofmt is the formatter of record, so a formatting drift is a failure
+      # rather than something a reviewer has to notice.
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -s -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt -s:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # The race detector runs here rather than on a developer machine because
+      # it needs CGO and a supported C compiler; Linux CI always has both.
+      - name: go test
+        run: go test -race -timeout 10m -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          if-no-files-found: error
+
+  demo:
+    name: Demo scenarios
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # The scenarios assert their expectations and exit non-zero on failure,
+      # so this is an end-to-end check of the delivery contract rather than a
+      # demonstration. It covers the paths unit tests cannot: real HTTP between
+      # the service and a simulated destination, retries, deduplication,
+      # result deadlines and escalation.
+      - name: Run scenarios
+        run: go run ./cmd/demo -v
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # Compile for every platform we publish binaries for, so a cross-platform
+      # mistake fails here instead of at release time.
+      - name: Cross-compile
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            goos="${target%/*}"
+            goarch="${target#*/}"
+            echo "building ${goos}/${goarch}"
+            suffix=""
+            if [ "$goos" = "windows" ]; then
+              suffix=".exe"
+            fi
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
+              go build -trimpath -o "dist/rc_vistart-${goos}-${goarch}${suffix}" ./cmd/rc_vistart
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
+              go build -trimpath -o "dist/mock_service-${goos}-${goarch}${suffix}" ./cmd/mock_service
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: dist
