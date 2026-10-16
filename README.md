@@ -8,147 +8,254 @@ the downstream endpoints those systems registered, and keeps trying until each
 notification is acknowledged.
 
 - **Accepts** order submissions over a small JSON HTTP API.
-- **Delivers** each step of an order to the downstream service that registered
-  for it, retrying with backoff and escalating whatever never lands.
+- **Delivers** each step of an order to the destination registered for it,
+  retrying with backoff and escalating whatever never lands.
 - **Tracks** every attempt, so "did we send it?" and "did we send it twice?"
   are both answerable after the fact.
 
 No third-party dependencies — only the Go standard library.
 
-## The guarantee, stated honestly
+## Contents
 
-Exactly-once delivery is not achievable over HTTP: a receiver that crashes after
-acting but before answering leaves the sender unable to tell "done" from "never
-arrived". `rc_vistart` therefore guarantees **at-least-once delivery per task**,
-paired with two things that make that safe:
+- [Demo scenarios](#demo-scenarios)
+- [Architecture](#architecture)
+- [The delivery guarantee](#the-delivery-guarantee)
+- [Orders and steps](#orders-and-steps)
+- [Registering a destination](#registering-a-destination)
+- [HTTP API](#http-api)
+- [Retries and escalation](#retries-and-escalation)
+- [Monitoring](#monitoring)
+- [Configuration](#configuration)
+- [Running the service by hand](#running-the-service-by-hand)
+- [Development](#development)
+- [Prototype limitations](#prototype-limitations)
 
-1. **A task key that survives retries.** Every step of an order has the stable
-   identity `<order id>/<step name>`. It does not change across retries, so a
-   receiver can tell a retry from a new task and apply the effect once.
-2. **An audit trail.** Every attempt is recorded, so a missing or repeated
-   notification is visible rather than silent.
+## Demo scenarios
+
+`make demo` starts a real service and real simulated destinations, drives the
+typical situations, and prints what happened at each step.
+
+```bash
+make demo           # every scenario
+make demo-list      # what is available
+make demo-retry     # just one
+make demo-verbose   # with the service log
+```
+
+Each scenario **asserts its expectations**, so the command exits non-zero if
+anything misbehaves. The demos are an end-to-end check, not decoration — the
+same scenarios also run under `go test ./...`.
+
+| Target                | Scenario                                             | Shows                                             |
+| --------------------- | ---------------------------------------------------- | -------------------------------------------------- |
+| `make demo-order`     | Standard order                                       | The phase gate: checks first, then fulfilment.     |
+| `make demo-simple`    | Ad registration, CRM contact                         | The single-notification business cases.            |
+| `make demo-retry`     | Destination rejects two attempts, then accepts       | Retry without duplicating the effect.              |
+| `make demo-silent`    | Destination answers 200 but never reports a result   | "We never heard back" becomes a retry, then an escalation. |
+| `make demo-permanent` | Destination rejects with 400                         | A wrong request is not retried.                    |
+| `make demo-missing`   | Nothing registered for the topic                     | A missing destination stops the order cleanly.     |
+
+The retry scenario is the one worth reading. The destination is told to reject
+the first two attempts and accept the third:
+
+```
+1/6  retry     Retry without duplicating the effect
+------------------------------------------------------------------------
+  The destination rejects the first two attempts and accepts the third. rc_vistart backs
+  off and tries again, so one task produces three notifications. Because the task key is
+  stable across retries, the destination applies the business effect exactly once.
+
+  [ok  ] order state = succeeded, want succeeded
+  [ok  ] delivery attempts = 3, want 3
+  [ok  ] notifications received = 3, want 3
+  [ok  ] business effects applied = 1, want 1
+  [ok  ] ledger entries = 3, want 3
+
+  step  phase    kind    state      attempts  notified  applied  last outcome
+  ship  prepare  notify  succeeded  3         3         1        http 200
+
+  PASS  retry (315ms)
+```
+
+Three notifications, one applied effect. That is the whole anti-duplication
+argument in one line of output.
+
+Scenarios run entirely in-process on ephemeral ports, so they need no setup and
+leave nothing behind.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  subgraph callers["Business systems"]
+    BIZ["Order service<br/>checkout · subscription · signup"]
+  end
+
+  subgraph svc["rc_vistart"]
+    API["HTTP API<br/>orders · endpoints · results"]
+    ENG["Order engine<br/>presets · phases · steps"]
+    QUE{{"Delivery queue<br/>in-memory, time ordered"}}
+    REG[("Endpoint registry<br/>service.action")]
+    STATS["Stats and escalations"]
+    API --> ENG
+    ENG --> QUE
+    ENG --> REG
+    ENG --> STATS
+  end
+
+  subgraph downstream["Registered destinations"]
+    INV["inventory"]
+    CRM["crm"]
+    ADS["ad network"]
+    PAY["payment"]
+  end
+
+  BIZ -->|"POST /api/v1/orders"| API
+  QUE -->|"HTTP, retried until acknowledged"| INV
+  QUE --> CRM
+  QUE --> ADS
+  QUE --> PAY
+  INV -->|"POST step result"| API
+  CRM -->|"POST step result"| API
+```
+
+Four moving parts, each with one job:
+
+| Part                | Responsibility                                                      |
+| ------------------- | ------------------------------------------------------------------- |
+| `internal/httpapi`  | HTTP surface. Knows nothing about delivery.                         |
+| `internal/order`    | Order graph, phases, step state machine, escalation.                |
+| `internal/notify`   | Endpoint registry, template rendering, HTTP invocation, queue, stats. |
+| `internal/config`   | Environment parsing and validation.                                 |
+
+The delivery engine does not know about orders, and the order engine does not
+speak HTTP. They meet only where the engine performs a delivery.
+
+`internal/mockservice` and `internal/demo` exist for the demos and for manual
+testing; nothing in the service depends on them.
+
+## The delivery guarantee
+
+Exactly-once delivery is not achievable over HTTP: a destination that crashes
+after acting but before answering leaves the sender unable to tell "done" from
+"never arrived". `rc_vistart` therefore guarantees **at-least-once delivery per
+task**, paired with two things that make it safe.
+
+**1. A task key that survives retries.** Every step has the stable identity
+`<order id>/<step name>`, sent as `X-Rc-Vistart-Idempotency-Key`. It does not
+change across retries, so a destination can tell a retry from new work. The
+per-attempt `X-Rc-Vistart-Delivery` id exists only for tracing.
+
+**2. An audit trail.** Every attempt is recorded in the step's ledger, so a
+dropped or repeated notification is visible rather than silent.
+
+```mermaid
+sequenceDiagram
+  participant B as Business system
+  participant R as rc_vistart
+  participant I as inventory
+
+  B->>R: POST /api/v1/orders
+  R->>I: attempt 1<br/>Idempotency-Key: ord_42/verify.stock
+  I-->>R: 503
+  Note over R: back off, same task key
+  R->>I: attempt 2<br/>Idempotency-Key: ord_42/verify.stock
+  I-->>R: 503
+  Note over R: back off again
+  R->>I: attempt 3<br/>Idempotency-Key: ord_42/verify.stock
+  I-->>R: 200
+  Note over I: effect applied once,<br/>two earlier attempts deduplicated
+```
+
+> **Both sides are responsible.** `rc_vistart` retries until acknowledged, and
+> retries a step whose *result* never arrives. The destination must deduplicate
+> on the task key. `internal/mockservice` shows the pattern, and the `retry`
+> demo proves it.
 
 Losing a notification is treated as the worse failure, because a duplicate
 notice is recoverable downstream and a dropped one is not.
 
-> **Both sides are responsible.** `rc_vistart` will retry until acknowledged, and
-> will retry a step whose *result* never arrives. The receiver must deduplicate
-> on the task key. `cmd/mock_service` shows the pattern.
-
-## How an order works
+## Orders and steps
 
 An order is a fixed graph of steps, created once and never mutated. Each step is
 one task with its own identity.
 
+```mermaid
+flowchart TD
+  subgraph prepare["prepare — verification"]
+    ID["verify.identity<br/>callback · identity.verify"]
+    STOCK["verify.stock<br/>callback · inventory.stock.prehold"]
+    PAY["verify.payment<br/>callback · payment.verify"]
+    ID --> STOCK
+    STOCK --> PAY
+  end
+
+  GATE{"every prepare step<br/>succeeded?"}
+
+  subgraph produce["produce — fulfilment"]
+    DEL["produce.delivery<br/>notify · fulfilment.delivery"]
+    OUT["stock.outbound<br/>notify · inventory.stock.outbound"]
+    DEL --> OUT
+  end
+
+  PAY --> GATE
+  GATE -->|yes| DEL
+  GATE -->|no| FAIL["order failed<br/>dependents skipped"]
 ```
-phase "prepare"                     phase "produce"
-  verify.identity  (callback) ─┐
-  verify.stock     (callback)  ├─ all must succeed ─┐
-  verify.payment   (callback) ─┘                     │
-                                                      ▼
-                                        produce.delivery (notify)
-                                                  │
-                                                  ▼
-                                        stock.outbound   (notify)
+
+Two kinds of step:
+
+| Kind        | Finished when                                                  |
+| ----------- | -------------------------------------------------------------- |
+| `notify`    | The destination answers with an expected status code.          |
+| `callback`  | The destination *also* posts a result to the URL it was given. |
+
+`callback` exists because a `200` only means the request was understood. Stock
+pre-deduction needs to know whether stock was actually reserved, so the step
+waits for an answer — and if the answer never comes, the step is retried, then
+escalated.
+
+Dependencies stay **inside** a phase. Moving to the next phase is what gates it,
+which is why `produce.delivery` declares no dependency on the checks: it cannot
+run until prepare has fully succeeded. An order with no produce steps finishes
+when its only phase does.
+
+```mermaid
+stateDiagram-v2
+  [*] --> pending
+  pending --> queued: dependencies met
+  pending --> skipped: a dependency failed
+  queued --> running: attempt starts
+  running --> succeeded: notify step acknowledged
+  running --> waiting: callback step acknowledged
+  waiting --> succeeded: result posted
+  waiting --> queued: result deadline missed
+  running --> queued: retryable failure
+  running --> escalated: permanent failure
+  queued --> escalated: attempt budget exhausted
+  succeeded --> [*]
+  escalated --> [*]
+  skipped --> [*]
 ```
 
-A step is one of two kinds:
+`skipped` is what keeps a broken graph from hanging: a step whose dependency
+failed is retired immediately rather than left waiting forever.
 
-| Kind        | Finished when                                                     |
-| ----------- | ----------------------------------------------------------------- |
-| `notify`    | The receiver answers with an expected status code.                |
-| `callback`  | The receiver *also* posts a result to the URL it was given.        |
+### Presets
 
-`callback` exists because an HTTP `200` only means the request was understood.
-Stock pre-deduction needs to know whether the stock was actually reserved, so
-the step waits for an answer — and if that answer never comes, the step is
-retried, then escalated.
-
-Dependencies must stay inside a phase. Moving to the next phase is what gates
-it, which is why `produce.delivery` declares no dependency on the checks: it
-cannot run until the prepare phase has fully succeeded.
-
-## Built-in presets
-
-| Preset           | Steps                                                     |
-| ---------------- | --------------------------------------------------------- |
-| `order.standard` | Identity, stock pre-deduction, payment → delivery, outbound |
-| `ad.registration`| Notify the ad system that a registration succeeded         |
-| `crm.contact`    | Move a CRM contact to a new status                         |
+| Preset            | Steps                                                      |
+| ----------------- | ---------------------------------------------------------- |
+| `order.standard`  | Identity, stock pre-deduction, payment → delivery, outbound |
+| `ad.registration` | Notify the ad network that a registration succeeded         |
+| `crm.contact`     | Move a CRM contact to a new status                          |
 
 `GET /api/v1/presets` returns them as JSON. A caller may pass a preset, supply
 its own step graph, or take the standard order by default.
 
-## Requirements
-
-- Go 1.27 or newer.
-
-## Quick start
-
-```bash
-go run ./cmd/rc_vistart          # listens on :8080
-curl http://localhost:8080/healthz
-```
-
-## Try it with the mock downstream
-
-`cmd/mock_service` stands in for any downstream service: it registers itself,
-receives notifications, reports results, and deduplicates on the task key. Its
-flags make the reliability paths easy to demonstrate.
-
-```bash
-go run ./cmd/rc_vistart &
-
-# A downstream that fails its first two attempts, then succeeds.
-go run ./cmd/mock_service \
-  -addr 127.0.0.1:9001 \
-  -service inventory -action stock.outbound \
-  -fail-first 2 -max-attempts 5
-```
-
-Submit an order and watch it complete:
-
-```bash
-curl -X POST http://localhost:8080/api/v1/orders \
-  -H 'Content-Type: application/json' \
-  -d '{"external_ref":"BIZ-1","subject":"user-42",
-       "items":[{"sku":"SKU-1","quantity":2}]}'
-```
-
-Then ask the mock what it received:
-
-```bash
-curl http://127.0.0.1:9001/state
-```
-
-```json
-{
-  "tasks": [
-    {
-      "task_key": "ord_.../stock.outbound",
-      "attempts": 3,
-      "applied": 1
-    }
-  ],
-  "effects": 1
-}
-```
-
-Three attempts were made, and the business effect was applied **once**. That is
-the anti-duplication guarantee in one object.
-
-Useful mock flags:
-
-| Flag             | Demonstrates                                        |
-| ---------------- | --------------------------------------------------- |
-| `-fail-first N`  | Retry, then success                                 |
-| `-fail-forever`  | Escalation after the attempt budget is spent        |
-| `-silent`        | Acknowledged but no result → result-timeout retry   |
-
-## Registering a downstream endpoint
+## Registering a destination
 
 Each destination registers itself. Re-registering the same topic replaces the
-previous registration, keeping the id, so a service can rotate its URL without
+previous registration and keeps the id, so a service can rotate its URL without
 creating a second destination for one task.
 
 ```bash
@@ -170,71 +277,90 @@ curl -X POST http://localhost:8080/api/v1/endpoints \
       }'
 ```
 
-| Field            | Meaning                                                             |
-| ---------------- | ------------------------------------------------------------------- |
+| Field             | Meaning                                                    |
+| ----------------- | ---------------------------------------------------------- |
 | `service`, `action` | The topic is `<service>.<action>`, e.g. `inventory.stock.prehold`. |
-| `method`         | `POST`, `PUT` or `PATCH`.                                           |
-| `url`            | Templated target URL.                                               |
-| `headers`, `body`| Templated request headers and body.                                 |
-| `expect_status`  | Status codes that count as an acknowledgement.                      |
-| `timeout`        | Deadline for one attempt, including the wait for the response.      |
-| `result_timeout` | How long a `callback` step waits for its result.                    |
-| `max_attempts`   | Attempts before the task is escalated.                              |
-| `backoff_*`      | Exponential retry delay bounds.                                     |
-| `secret`         | Shared key exposed to templates as `.secret`.                       |
+| `method`          | `POST`, `PUT` or `PATCH`.                                  |
+| `url`             | Templated target URL.                                      |
+| `headers`, `body` | Templated request headers and body.                        |
+| `expect_status`   | Status codes that count as an acknowledgement.             |
+| `timeout`         | Deadline for one attempt, including the wait for a response. |
+| `result_timeout`  | How long a `callback` step waits for its result.           |
+| `max_attempts`    | Attempts before the task is escalated.                     |
+| `backoff_*`       | Exponential retry delay bounds.                            |
+| `secret`          | Shared key exposed to templates as `.secret`.              |
 
-Registration validates everything up front: the templates are parsed, rendered
+Registration validates everything up front: templates are parsed, rendered
 against sample data, and checked for references that could never resolve. A
 registration that cannot work is rejected with `400` rather than failing on the
 third retry of a live order.
 
 ### Template context
 
-| Reference           | Value                                                   |
-| ------------------- | ------------------------------------------------------- |
-| `.order.id`         | Order id.                                               |
-| `.order.external_ref` | The caller's own reference.                           |
-| `.order.subject`    | Subject of the order.                                   |
-| `.order.phase`      | `prepare` or `produce`.                                 |
-| `.step.name`        | Step name.                                              |
-| `.step.attempt`     | Attempt number, starting at 1.                          |
-| `.step.topic`       | Topic being delivered to.                               |
-| `.items`            | List of `{sku, name, quantity, price}`.                 |
-| `.payload`          | The caller-supplied payload.                            |
-| `.idempotency_key`  | The stable task key.                                    |
-| `.delivery_id`      | This attempt's id. Differs per attempt, for tracing.    |
-| `.result_url`       | Where to post a result for a `callback` step.           |
-| `.secret`           | The registration's shared secret.                       |
-| `.timestamp`, `.unix` | Send time, RFC 3339 and Unix seconds.                  |
-| `.body`             | The rendered body. **Header templates only.**          |
-| `.signature`        | `HMAC-SHA256(secret, "<unix>.<body>")`. **Headers only.** |
+| Reference             | Value                                                |
+| --------------------- | ---------------------------------------------------- |
+| `.order.id`           | Order id.                                            |
+| `.order.external_ref` | The caller's own reference.                          |
+| `.order.subject`      | Subject of the order.                                |
+| `.order.phase`        | `prepare` or `produce`.                              |
+| `.step.name`          | Step name.                                           |
+| `.step.attempt`       | Attempt number, starting at 1.                       |
+| `.step.topic`         | Topic being delivered to.                            |
+| `.items`              | List of `{sku, name, quantity, price}`.              |
+| `.payload`            | The caller-supplied payload.                         |
+| `.idempotency_key`    | The stable task key.                                 |
+| `.delivery_id`        | This attempt's id; differs per attempt, for tracing. |
+| `.result_url`         | Where to post a result for a `callback` step.        |
+| `.secret`             | The registration's shared secret.                    |
+| `.timestamp`, `.unix` | Send time, RFC 3339 and Unix seconds.                |
+| `.body`               | The rendered body. **Header templates only.**        |
+| `.signature`          | `HMAC-SHA256(secret, "<unix>.<body>")`. **Headers only.** |
 
 Helpers: `json`, `urlquery`, `hmacSHA256`, `default`, `upper`, `lower`, `trim`.
 
-The URL and the body render first, then the headers — so a header can sign the
-body, which is what reproducing a vendor's own signing scheme requires. For the
+```mermaid
+flowchart LR
+  URL["url template"] --> BODY["body template"]
+  BODY --> SIG["signature = HMAC of body"]
+  SIG --> HDR["header templates<br/>may read .body and .signature"]
+```
+
+The URL and body render first, then the headers — so a header can sign the body,
+which is what reproducing a destination's own signing scheme requires. For the
 same reason `.signature` and `.body` are rejected inside the URL and body: the
 signature covers the body, so it cannot appear within it.
 
 An absent key in `.payload` fails the delivery rather than sending a blank field
-to a vendor. Use `{{ default "x" (index .payload "maybe") }}` for an optional
-value.
+to a destination. Use `{{ default "x" (index .payload "maybe") }}` for an
+optional value.
 
 ## HTTP API
 
-| Method   | Path                                          | Purpose                             |
-| -------- | --------------------------------------------- | ----------------------------------- |
-| `GET`    | `/healthz`                                    | Liveness probe.                     |
-| `POST`   | `/api/v1/endpoints`                           | Register a destination.             |
-| `GET`    | `/api/v1/endpoints`                           | List registrations.                 |
-| `DELETE` | `/api/v1/endpoints/{topic}`                   | Remove a registration.              |
-| `GET`    | `/api/v1/presets`                             | Built-in step graphs.               |
-| `POST`   | `/api/v1/orders`                               | Submit an order.                    |
-| `GET`    | `/api/v1/orders`                               | List orders, optionally `?state=`.  |
-| `GET`    | `/api/v1/orders/{id}`                          | Inspect an order and its ledger.    |
-| `POST`   | `/api/v1/orders/{id}/steps/{step}/result`      | Post a step result (receivers).     |
-| `GET`    | `/api/v1/stats`                                | Per-endpoint delivery statistics.   |
-| `GET`    | `/api/v1/escalations`                          | Tasks needing a human.              |
+| Method   | Path                                      | Purpose                            |
+| -------- | ----------------------------------------- | ---------------------------------- |
+| `GET`    | `/healthz`                                | Liveness probe.                    |
+| `POST`   | `/api/v1/endpoints`                       | Register a destination.            |
+| `GET`    | `/api/v1/endpoints`                       | List registrations.                |
+| `DELETE` | `/api/v1/endpoints/{topic}`               | Remove a registration.             |
+| `GET`    | `/api/v1/presets`                         | Built-in step graphs.              |
+| `POST`   | `/api/v1/orders`                          | Submit an order.                   |
+| `GET`    | `/api/v1/orders`                          | List orders, optionally `?state=`. |
+| `GET`    | `/api/v1/orders/{id}`                     | Inspect an order and its ledger.   |
+| `POST`   | `/api/v1/orders/{id}/steps/{step}/result` | Post a step result.                |
+| `GET`    | `/api/v1/stats`                           | Per-destination delivery statistics. |
+| `GET`    | `/api/v1/escalations`                     | Tasks needing a human.             |
+
+### Submitting an order
+
+```bash
+curl -X POST http://localhost:8080/api/v1/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"external_ref":"BIZ-2026-0042","subject":"user-42",
+       "items":[{"sku":"SKU-1","quantity":2,"price":19.9}],
+       "payload":{"channel":"app"}}'
+```
+
+Omit `preset` for the standard order, name one, or send your own `steps`.
 
 ### Reporting a result
 
@@ -245,12 +371,12 @@ curl -X POST http://localhost:8080/api/v1/orders/$ORDER/steps/verify.stock/resul
 ```
 
 `delivery_id` must echo the `X-Rc-Vistart-Delivery` header of the delivery being
-answered, which is how a late or forged answer is rejected. Reposting an answer
-is harmless: a step that already finished ignores it rather than transitioning
+answered, which is how a late or forged answer is rejected. Reposting is
+harmless: a step that already finished ignores it rather than transitioning
 twice.
 
-`success: false` is a business rejection, not a transport failure, so it escalates
-immediately instead of burning the retry budget.
+`success: false` is a business rejection, not a transport failure, so it
+escalates immediately instead of burning the retry budget.
 
 ### Errors
 
@@ -267,19 +393,37 @@ humans.
 
 ## Retries and escalation
 
-| Failure                                | Retried?                                    |
-| -------------------------------------- | ------------------------------------------- |
-| Network error, timeout, `5xx`, `429`   | Yes, with exponential backoff.              |
-| No result within `result_timeout`      | Yes — this is "we never heard back".        |
-| `4xx`, redirect, unrenderable template | No. Retrying cannot fix a wrong request.    |
-| No endpoint registered for the topic   | Yes, then escalated. It may register later. |
+```mermaid
+flowchart TD
+  A["attempt sent"] --> B{"expected status?"}
+  B -->|yes, notify| C["succeeded"]
+  B -->|yes, callback| D["waiting for result"]
+  D --> E{"result before deadline?"}
+  E -->|yes| C
+  E -->|no| F["counted as a failed attempt"]
+  B -->|no| G{"failure class"}
+  G -->|"5xx · 429 · network · timeout"| H{"attempts left?"}
+  H -->|yes| I["back off and retry<br/>same task key"]
+  I --> A
+  H -->|no| J["escalated"]
+  G -->|"4xx · redirect · render error"| J
+  J --> K["operator reads /api/v1/escalations"]
+```
+
+| Failure                                 | Retried?                                   |
+| --------------------------------------- | ------------------------------------------ |
+| Network error, timeout, `5xx`, `429`    | Yes, with exponential backoff.             |
+| No result within `result_timeout`       | Yes — this is "we never heard back".       |
+| `4xx`, redirect, unrenderable template  | No. Retrying cannot fix a wrong request.   |
+| No endpoint registered for the topic    | Yes, then escalated. It may register late. |
 
 After the budget is spent the step becomes `escalated`, the order fails, and the
 task is listed in `/api/v1/escalations`. Dependent steps are `skipped` rather
-than left pending, so nothing waits forever.
+than left pending.
 
-Every attempt appears in the step's ledger, including its status code, latency
-and error.
+Every attempt appears in the step's ledger with its status code, latency and
+error, so "three attempts, one of which was 503 at 14:02:11" is answerable
+afterwards.
 
 ## Monitoring
 
@@ -293,42 +437,53 @@ the hook a real deployment would page from.
 
 ## Configuration
 
-| Variable                                | Default                 | Meaning                            |
-| --------------------------------------- | ----------------------- | ---------------------------------- |
-| `RC_VISTART_ADDR`                       | `:8080`                 | Listen address.                    |
-| `RC_VISTART_PUBLIC_URL`                 | `http://localhost:8080` | Base URL receivers post results to.|
-| `RC_VISTART_WORKERS`                    | `8`                     | Concurrent delivery attempts.      |
-| `RC_VISTART_POLL_INTERVAL`              | `50ms`                  | Idle worker re-check interval.     |
-| `RC_VISTART_READ_TIMEOUT`               | `5s`                    | Read deadline per request.         |
-| `RC_VISTART_WRITE_TIMEOUT`              | `10s`                   | Write deadline per response.       |
-| `RC_VISTART_IDLE_TIMEOUT`               | `60s`                   | Idle keep-alive timeout.           |
-| `RC_VISTART_SHUTDOWN_TIMEOUT`           | `15s`                   | Grace period on SIGINT/SIGTERM.    |
-| `RC_VISTART_MAX_BODY_BYTES`             | `1048576`               | Maximum request body.              |
-| `RC_VISTART_MAX_CALLBACK_RESPONSE_BYTES`| `65536`                 | Response bytes read per delivery.  |
-| `RC_VISTART_LOG_LEVEL`                  | `info`                  | `debug`, `info`, `warn`, `error`.  |
-| `RC_VISTART_LOG_FORMAT`                 | `json`                  | `json` or `text`.                  |
+| Variable                                 | Default                 | Meaning                             |
+| ---------------------------------------- | ----------------------- | ----------------------------------- |
+| `RC_VISTART_ADDR`                        | `:8080`                 | Listen address.                     |
+| `RC_VISTART_PUBLIC_URL`                  | `http://localhost:8080` | Base URL destinations post results to. |
+| `RC_VISTART_WORKERS`                     | `8`                     | Concurrent delivery attempts.       |
+| `RC_VISTART_POLL_INTERVAL`               | `50ms`                  | Idle worker re-check interval.      |
+| `RC_VISTART_READ_TIMEOUT`                | `5s`                    | Read deadline per request.          |
+| `RC_VISTART_WRITE_TIMEOUT`               | `10s`                   | Write deadline per response.        |
+| `RC_VISTART_IDLE_TIMEOUT`                | `60s`                   | Idle keep-alive timeout.            |
+| `RC_VISTART_SHUTDOWN_TIMEOUT`            | `15s`                   | Grace period on SIGINT/SIGTERM.     |
+| `RC_VISTART_MAX_BODY_BYTES`              | `1048576`               | Maximum request body.               |
+| `RC_VISTART_MAX_CALLBACK_RESPONSE_BYTES` | `65536`                 | Response bytes read per delivery.   |
+| `RC_VISTART_LOG_LEVEL`                   | `info`                  | `debug`, `info`, `warn`, `error`.   |
+| `RC_VISTART_LOG_FORMAT`                  | `json`                  | `json` or `text`.                   |
 
-> **`RC_VISTART_PUBLIC_URL` matters.** Receivers are told where to post results
-> through it. If it is unreachable from their network, every `callback` step
-> will time out and be retried.
+> **`RC_VISTART_PUBLIC_URL` matters.** Destinations are told where to post
+> results through it. If it is unreachable from their network, every `callback`
+> step will time out and be retried.
 
 `rc_vistart` shuts down gracefully on `SIGINT`/`SIGTERM`, letting in-flight
 deliveries finish within the grace period.
 
-## Prototype limitations
+## Running the service by hand
 
-Stated plainly, because the design is otherwise easy to over-read:
+The demos cover the automated path. For manual work, run the service and a mock
+destination:
 
-- **State is in memory.** Endpoint registrations and orders are lost on restart.
-  A production version needs durable storage for both; the `notify.Registry`
-  interface and the order store are where that would plug in.
-- **The step result endpoint is unauthenticated** beyond matching the delivery
-  id. A real deployment needs per-service credentials or mTLS.
-- **Escalation is a log line and an API view**, not a page.
-- **The queue is a sorted slice**, fine for thousands of pending tasks, not
-  millions.
-- **`rc_vistart` never cancels work** it has already queued during shutdown
-  beyond the grace period.
+```bash
+make run                                              # rc_vistart on :8080
+make mock ARGS="-service inventory -action stock.prehold"   # a destination on :9001
+```
+
+`mock_service` flags make the reliability paths easy to poke at by hand:
+
+| Flag                       | Demonstrates                                      |
+| -------------------------- | ------------------------------------------------- |
+| `-fail-first N`            | Retry, then success                               |
+| `-fail-status 400`         | A permanent failure, not retried                  |
+| `-fail-forever`            | Escalation once the budget is spent               |
+| `-silent`                  | Acknowledged but no result → result-timeout retry |
+| `-result-timeout`, `-max-attempts`, `-backoff-*` | The timing knobs |
+
+Inspect what a destination actually received:
+
+```bash
+curl http://localhost:9001/state
+```
 
 ## Development
 
@@ -338,7 +493,7 @@ There is no remote CI for this project — verification is local.
 make check   # gofmt check, go vet, tests
 make test    # go test ./...
 make cover   # coverage.out + coverage.html
-make build   # bin/rc_vistart and bin/mock_service
+make build   # bin/rc_vistart, bin/mock_service, bin/demo
 make help    # list every target
 ```
 
@@ -346,8 +501,8 @@ Without `make` (or on Windows, where `make` may not be installed):
 
 ```bash
 gofmt -s -l . && go vet ./... && go test ./...
+go run ./cmd/demo
 go build -o bin/rc_vistart.exe ./cmd/rc_vistart
-go build -o bin/mock_service.exe ./cmd/mock_service
 ```
 
 > **Note on `-race`:** `make test-race` runs `go test -race ./...`, which needs a
@@ -358,17 +513,35 @@ go build -o bin/mock_service.exe ./cmd/mock_service
 ## Project layout
 
 ```
-cmd/rc_vistart/     Service entry point, wiring and graceful shutdown
-cmd/mock_service/   Simulated downstream, for demos and manual testing
-internal/notify/    Endpoint registry, templates, HTTP invoker, queue, stats
-internal/order/     Order model, presets and the orchestration engine
-internal/httpapi/   Routing and request/response handling
-internal/config/    Environment-based configuration
-internal/version/   Build metadata injected via -ldflags
+cmd/rc_vistart/       Service entry point, wiring and graceful shutdown
+cmd/mock_service/     CLI around internal/mockservice
+cmd/demo/             Demo runner: reports, and exits non-zero on failure
+internal/notify/      Endpoint registry, templates, HTTP invoker, queue, stats
+internal/order/       Order model, presets and the orchestration engine
+internal/httpapi/     Routing and request/response handling
+internal/mockservice/ Simulated destination, shared by the demo and the CLI
+internal/demo/        Scenario definitions and the harness they run in
+internal/config/      Environment-based configuration
+internal/version/     Build metadata injected via -ldflags
 ```
 
-The delivery engine does not know about orders and the engine does not know
-about HTTP; they meet only at the engine's delivery step.
+## Prototype limitations
+
+Stated plainly, because the design is otherwise easy to over-read:
+
+- **State is in memory.** Endpoint registrations, orders and the queue are lost
+  on restart. A production version needs durable storage for all three; the
+  `notify.Registry` interface and the engine's order store are where it would
+  plug in.
+- **The step result endpoint is unauthenticated** beyond matching the delivery
+  id. A real deployment needs per-service credentials or mTLS.
+- **Escalation is a log line and an API view**, not a page.
+- **The queue is a sorted slice**, fine for thousands of pending tasks, not
+  millions.
+- **`rc_vistart` does not resume interrupted deliveries** after a restart, which
+  follows from the first point.
+- **Deduplication is the destination's job.** The service makes it possible by
+  keeping the task key stable; it cannot enforce it.
 
 ## License
 

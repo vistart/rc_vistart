@@ -116,6 +116,15 @@ func (e *Engine) Stop() {
 	e.wg.Wait()
 }
 
+// SetPublicURL sets the externally reachable base URL handed to receivers as
+// .result_url. A service that learns its address only after binding must set
+// this before it starts accepting deliveries.
+func (e *Engine) SetPublicURL(url string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.cfg.PublicURL = trimSlash(url)
+}
+
 // ResultURL is where a receiver posts the result of a callback step.
 func (e *Engine) ResultURL(orderID, stepName string) string {
 	return fmt.Sprintf("%s/api/v1/orders/%s/steps/%s/result", e.cfg.PublicURL, orderID, stepName)
