@@ -711,6 +711,92 @@ func TestFailedPrepareStepSkipsTheRest(t *testing.T) {
 	}
 }
 
+// eagerInvoker posts the step result before returning the HTTP response, which
+// is legal and is what a fast receiver does. It reproduces the interleaving
+// where the result beats the response.
+type eagerInvoker struct {
+	engine  *Engine
+	orderID string
+	step    string
+}
+
+func (e *eagerInvoker) Invoke(_ context.Context, _ notify.Endpoint, in notify.ContextInput) (notify.Result, error) {
+	if _, err := e.engine.SubmitResult(e.orderID, e.step, in.DeliveryID, true, nil); err != nil {
+		return notify.Result{}, &notify.Failure{Kind: notify.FailureNetwork, Err: err}
+	}
+	return notify.Result{StatusCode: 200}, nil
+}
+
+func TestResultArrivingBeforeTheResponseWins(t *testing.T) {
+	// If the response were applied after the result, the step would be dragged
+	// back into waiting, never complete, and be retried once its deadline
+	// passed. The result is the stronger signal, so it must win.
+	registry := notify.NewMemoryRegistry()
+	engine := NewEngine(registry, nil, notify.NewStats(), Config{
+		Workers:      2,
+		PollInterval: 5 * time.Millisecond,
+		PublicURL:    "http://rc.test",
+	}, quietLogger())
+	engine.Start()
+	defer engine.Stop()
+
+	inv := &eagerInvoker{engine: engine, orderID: "ord_eager", step: "reserve"}
+	engine.invoker = inv
+
+	if _, err := registry.Register(notify.Endpoint{
+		Service:       "inventory",
+		Action:        "stock.prehold",
+		URL:           "http://inv.test/prehold",
+		MaxAttempts:   3,
+		ResultTimeout: 200 * time.Millisecond,
+		BackoffBase:   time.Millisecond,
+	}); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	if _, err := engine.Submit(Spec{ID: "ord_eager", Steps: []StepSpec{{
+		Name:  "reserve",
+		Phase: PhasePrepare,
+		Kind:  KindCallback,
+		Topic: "inventory.stock.prehold",
+	}}}); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if o, err := engine.Get("ord_eager"); err == nil && o.State.Terminal() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	o, err := engine.Get("ord_eager")
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	s, err := o.Step("reserve")
+	if err != nil {
+		t.Fatalf("Step() error = %v", err)
+	}
+
+	if s.State != StateSucceeded {
+		t.Errorf("step state = %q, want succeeded: the result must not be undone by the response", s.State)
+	}
+	if s.PendingDeliveryID != "" {
+		t.Errorf("PendingDeliveryID = %q, want it cleared once the result was applied", s.PendingDeliveryID)
+	}
+	if s.Attempts != 1 {
+		t.Errorf("attempts = %d, want 1: a completed step must not be retried", s.Attempts)
+	}
+	if o.State != OrderSucceeded {
+		t.Errorf("order state = %q, want succeeded", o.State)
+	}
+	if len(engine.Escalations()) != 0 {
+		t.Errorf("escalations = %d, want 0", len(engine.Escalations()))
+	}
+}
+
 func TestSnapshotLookupIsIsolatedFromTheEngine(t *testing.T) {
 	// A snapshot must be a real snapshot. Reaching it through Step() used to
 	// hand back a pointer into the engine's live step, so a caller could read

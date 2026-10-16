@@ -636,6 +636,20 @@ func (e *Engine) execute(task notify.Task) error {
 		return nil
 	}
 
+	// A receiver is allowed to post its result before it returns the HTTP
+	// response, and a fast one will. If that already resolved the step, this
+	// attempt's outcome is stale: applying it would drag a finished step back
+	// into waiting, where it would sit until its deadline and then be
+	// retried. Only the delivery this attempt is still waiting on may change
+	// the step.
+	if s.PendingDeliveryID != task.DeliveryID {
+		e.logger.Debug("discarding a stale delivery outcome",
+			slog.String("task_key", task.Key),
+			slog.String("step_state", string(s.State)),
+		)
+		return nil
+	}
+
 	if invokeErr != nil {
 		return e.applyFailureLocked(o, s, ep, task, res, invokeErr)
 	}
