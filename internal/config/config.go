@@ -14,6 +14,9 @@ import (
 type Config struct {
 	// Addr is the TCP address the HTTP server listens on.
 	Addr string
+	// PublicURL is the base URL receivers use to reach this service, which is
+	// handed to them as .result_url in every delivery.
+	PublicURL string
 	// ReadTimeout bounds reading a whole request, including the body.
 	ReadTimeout time.Duration
 	// WriteTimeout bounds writing a response.
@@ -25,29 +28,28 @@ type Config struct {
 	ShutdownTimeout time.Duration
 	// MaxBodyBytes bounds the size of a request body that is accepted.
 	MaxBodyBytes int64
-	// DefaultCallbackTimeout is applied to callbacks that do not request a
-	// timeout of their own.
-	DefaultCallbackTimeout time.Duration
 	// MaxCallbackResponseBytes bounds how much of a callback response body is
 	// read before the connection is dropped.
 	MaxCallbackResponseBytes int64
-	// MaxParallelCallbacks bounds how many callbacks of a single event are
-	// invoked concurrently.
-	MaxParallelCallbacks int
+	// Workers is the number of concurrent delivery attempts.
+	Workers int
+	// PollInterval is how often an idle worker re-checks the delivery queue.
+	PollInterval time.Duration
 }
 
 // Default returns the configuration used when no environment variable is set.
 func Default() Config {
 	return Config{
 		Addr:                     ":8080",
+		PublicURL:                "http://localhost:8080",
 		ReadTimeout:              5 * time.Second,
 		WriteTimeout:             10 * time.Second,
 		IdleTimeout:              60 * time.Second,
 		ShutdownTimeout:          15 * time.Second,
 		MaxBodyBytes:             1 << 20,
-		DefaultCallbackTimeout:   5 * time.Second,
 		MaxCallbackResponseBytes: 64 << 10,
-		MaxParallelCallbacks:     8,
+		Workers:                  8,
+		PollInterval:             50 * time.Millisecond,
 	}
 }
 
@@ -59,6 +61,9 @@ func Load() (Config, error) {
 	var err error
 
 	if cfg.Addr, err = envAddr("RC_VISTART_ADDR", cfg.Addr); err != nil {
+		return Config{}, err
+	}
+	if cfg.PublicURL, err = envRequired("RC_VISTART_PUBLIC_URL", cfg.PublicURL); err != nil {
 		return Config{}, err
 	}
 	if cfg.ReadTimeout, err = envDuration("RC_VISTART_READ_TIMEOUT", cfg.ReadTimeout); err != nil {
@@ -76,29 +81,61 @@ func Load() (Config, error) {
 	if cfg.MaxBodyBytes, err = envInt64("RC_VISTART_MAX_BODY_BYTES", cfg.MaxBodyBytes); err != nil {
 		return Config{}, err
 	}
-	if cfg.DefaultCallbackTimeout, err = envDuration("RC_VISTART_CALLBACK_TIMEOUT", cfg.DefaultCallbackTimeout); err != nil {
-		return Config{}, err
-	}
 	if cfg.MaxCallbackResponseBytes, err = envInt64("RC_VISTART_MAX_CALLBACK_RESPONSE_BYTES", cfg.MaxCallbackResponseBytes); err != nil {
 		return Config{}, err
 	}
-	if cfg.MaxParallelCallbacks, err = envInt("RC_VISTART_MAX_PARALLEL_CALLBACKS", cfg.MaxParallelCallbacks); err != nil {
+	if cfg.Workers, err = envInt("RC_VISTART_WORKERS", cfg.Workers); err != nil {
+		return Config{}, err
+	}
+	if cfg.PollInterval, err = envDuration("RC_VISTART_POLL_INTERVAL", cfg.PollInterval); err != nil {
 		return Config{}, err
 	}
 
 	if cfg.Addr == "" {
 		return Config{}, fmt.Errorf("config: RC_VISTART_ADDR must not be empty")
 	}
-	if cfg.MaxParallelCallbacks < 1 {
-		return Config{}, fmt.Errorf("config: RC_VISTART_MAX_PARALLEL_CALLBACKS must be at least 1, got %d", cfg.MaxParallelCallbacks)
+	if cfg.PublicURL == "" {
+		return Config{}, fmt.Errorf("config: RC_VISTART_PUBLIC_URL must not be empty")
+	}
+	if cfg.Workers < 1 {
+		return Config{}, fmt.Errorf("config: RC_VISTART_WORKERS must be at least 1, got %d", cfg.Workers)
 	}
 	return cfg, nil
+}
+
+// envString returns the trimmed value of key, or fallback when it is unset or
+// blank.
+func envString(key, fallback string) (string, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok {
+		return fallback, nil
+	}
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return fallback, nil
+	}
+	return v, nil
 }
 
 // envAddr behaves like envString, except that an explicitly blank value is an
 // error rather than a silent fallback: a service with no listen address cannot
 // start, so the mistake should surface immediately.
 func envAddr(key, fallback string) (string, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok {
+		return fallback, nil
+	}
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "", fmt.Errorf("config: %s must not be empty", key)
+	}
+	return v, nil
+}
+
+// envRequired behaves like envString, except that an explicitly blank value is
+// an error rather than a silent fallback. A required setting that quietly
+// reverts to its default is a misconfiguration nobody ever sees.
+func envRequired(key, fallback string) (string, error) {
 	v, ok := os.LookupEnv(key)
 	if !ok {
 		return fallback, nil

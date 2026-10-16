@@ -18,14 +18,15 @@ func TestDefault(t *testing.T) {
 
 func TestLoadFromEnvironment(t *testing.T) {
 	t.Setenv("RC_VISTART_ADDR", "127.0.0.1:9999")
+	t.Setenv("RC_VISTART_PUBLIC_URL", "https://notify.example.com")
 	t.Setenv("RC_VISTART_READ_TIMEOUT", "3s")
 	t.Setenv("RC_VISTART_WRITE_TIMEOUT", "7s")
 	t.Setenv("RC_VISTART_IDLE_TIMEOUT", "90s")
 	t.Setenv("RC_VISTART_SHUTDOWN_TIMEOUT", "2s")
+	t.Setenv("RC_VISTART_POLL_INTERVAL", "250ms")
 	t.Setenv("RC_VISTART_MAX_BODY_BYTES", "4096")
-	t.Setenv("RC_VISTART_CALLBACK_TIMEOUT", "1500ms")
 	t.Setenv("RC_VISTART_MAX_CALLBACK_RESPONSE_BYTES", "2048")
-	t.Setenv("RC_VISTART_MAX_PARALLEL_CALLBACKS", "3")
+	t.Setenv("RC_VISTART_WORKERS", "3")
 
 	cfg, err := Load()
 	if err != nil {
@@ -38,14 +39,15 @@ func TestLoadFromEnvironment(t *testing.T) {
 		want any
 	}{
 		{"Addr", cfg.Addr, "127.0.0.1:9999"},
+		{"PublicURL", cfg.PublicURL, "https://notify.example.com"},
 		{"ReadTimeout", cfg.ReadTimeout, 3 * time.Second},
 		{"WriteTimeout", cfg.WriteTimeout, 7 * time.Second},
 		{"IdleTimeout", cfg.IdleTimeout, 90 * time.Second},
 		{"ShutdownTimeout", cfg.ShutdownTimeout, 2 * time.Second},
+		{"PollInterval", cfg.PollInterval, 250 * time.Millisecond},
 		{"MaxBodyBytes", cfg.MaxBodyBytes, int64(4096)},
-		{"DefaultCallbackTimeout", cfg.DefaultCallbackTimeout, 1500 * time.Millisecond},
 		{"MaxCallbackResponseBytes", cfg.MaxCallbackResponseBytes, int64(2048)},
-		{"MaxParallelCallbacks", cfg.MaxParallelCallbacks, 3},
+		{"Workers", cfg.Workers, 3},
 	}
 	for _, tc := range checks {
 		if tc.got != tc.want {
@@ -78,20 +80,24 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 	}{
 		{"bad duration", "RC_VISTART_READ_TIMEOUT", "ten seconds"},
 		{"zero duration", "RC_VISTART_READ_TIMEOUT", "0s"},
-		{"negative duration", "RC_VISTART_CALLBACK_TIMEOUT", "-1s"},
+		{"negative duration", "RC_VISTART_POLL_INTERVAL", "-1s"},
 		{"bad int", "RC_VISTART_MAX_BODY_BYTES", "lots"},
 		{"bad int64", "RC_VISTART_MAX_CALLBACK_RESPONSE_BYTES", "1.5"},
 		{"empty addr", "RC_VISTART_ADDR", " "},
-		{"parallel below one", "RC_VISTART_MAX_PARALLEL_CALLBACKS", "0"},
+		{"empty public url", "RC_VISTART_PUBLIC_URL", " "},
+		{"workers below one", "RC_VISTART_WORKERS", "0"},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv(tc.key, tc.value)
-			// An empty addr must be reported as an error, so pin a valid one
-			// for the cases that are not about the address.
+			// Every case except the address ones needs a valid addr, and every
+			// case except the public-url one needs a valid public url.
 			if tc.key != "RC_VISTART_ADDR" {
 				t.Setenv("RC_VISTART_ADDR", ":8080")
+			}
+			if tc.key != "RC_VISTART_PUBLIC_URL" {
+				t.Setenv("RC_VISTART_PUBLIC_URL", "http://localhost:8080")
 			}
 
 			_, err := Load()

@@ -4,6 +4,7 @@
 # targets are the whole verification story: run `make check` before pushing.
 
 BINARY      := bin/rc_vistart
+MOCK        := bin/mock_service
 PKG         := ./...
 VERSION     ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT      ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -21,11 +22,12 @@ help: ## Show this help
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
 .PHONY: build
-build: ## Compile the binary into bin/
+build: ## Compile the service and the mock downstream into bin/
 	go build -trimpath -ldflags "$(LDFLAGS)" -o $(BINARY) ./cmd/rc_vistart
+	go build -trimpath -ldflags "$(LDFLAGS)" -o $(MOCK) ./cmd/mock_service
 
 .PHONY: install
-install: ## Install the binary into GOBIN
+install: ## Install the service into GOBIN
 	go install -trimpath -ldflags "$(LDFLAGS)" ./cmd/rc_vistart
 
 .PHONY: test
@@ -71,6 +73,10 @@ check: fmt-check vet test ## Everything that must pass before pushing
 .PHONY: run
 run: ## Run the service locally on :8080
 	go run ./cmd/rc_vistart
+
+.PHONY: mock
+mock: ## Run a mock downstream on :9001 (add ARGS="..." to configure it)
+	go run ./cmd/mock_service $(ARGS)
 
 .PHONY: clean
 clean: ## Remove build and coverage output

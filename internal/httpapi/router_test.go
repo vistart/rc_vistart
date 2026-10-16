@@ -12,60 +12,56 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vistart/rc_vistart/internal/callback"
+	"github.com/vistart/rc_vistart/internal/notify"
+	"github.com/vistart/rc_vistart/internal/order"
 )
 
-type testServer struct {
-	*httptest.Server
-	registry   *callback.MemoryRegistry
-	dispatcher *callback.Dispatcher
-	invoker    callback.Invoker
+type testStack struct {
+	server   *httptest.Server
+	registry *notify.MemoryRegistry
+	engine   *order.Engine
+	stats    *notify.Stats
 }
 
-func newTestServer(t *testing.T, invoker callback.Invoker) *testServer {
+func newTestStack(t *testing.T, invoker notify.Invoker) *testStack {
 	t.Helper()
 
-	registry := callback.NewMemoryRegistry()
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	dispatcher := callback.NewDispatcher(registry, invoker, time.Second, 4, logger)
+	registry := notify.NewMemoryRegistry()
+	stats := notify.NewStats()
+	engine := order.NewEngine(registry, invoker, stats, order.Config{
+		Workers:      2,
+		PollInterval: 2 * time.Millisecond,
+		PublicURL:    "http://rc.test",
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	engine.Start()
+	t.Cleanup(engine.Stop)
 
 	srv := httptest.NewServer(NewRouter(Dependencies{
 		Registry:     registry,
-		Dispatcher:   dispatcher,
-		Logger:       logger,
+		Stats:        stats,
+		Engine:       engine,
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 		MaxBodyBytes: 1 << 20,
 	}))
 	t.Cleanup(srv.Close)
 
-	return &testServer{Server: srv, registry: registry, dispatcher: dispatcher, invoker: invoker}
+	return &testStack{server: srv, registry: registry, engine: engine, stats: stats}
 }
 
-// stubInvoker records the callbacks it is handed and fails those listed in
-// failFor.
-type stubInvoker struct {
-	mu      sync.Mutex
-	calls   []callback.Callback
-	failFor map[string]error
+// recordingInvoker accepts every delivery and does nothing else.
+type recordingInvoker struct {
+	mu    sync.Mutex
+	calls []notify.ContextInput
 }
 
-func (s *stubInvoker) Invoke(_ context.Context, cb callback.Callback, _ string, _ []byte) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.calls = append(s.calls, cb)
-	return s.failFor[cb.ID]
+func (r *recordingInvoker) Invoke(_ context.Context, ep notify.Endpoint, in notify.ContextInput) (notify.Result, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, in)
+	return notify.Result{StatusCode: 200}, nil
 }
 
-func (s *stubInvoker) ids() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]string, 0, len(s.calls))
-	for _, cb := range s.calls {
-		out = append(out, cb.ID)
-	}
-	return out
-}
-
-func doJSON(t *testing.T, method, url string, body any) *http.Response {
+func (s *testStack) do(t *testing.T, method, path string, body any) *http.Response {
 	t.Helper()
 
 	var reader io.Reader
@@ -76,8 +72,7 @@ func doJSON(t *testing.T, method, url string, body any) *http.Response {
 		}
 		reader = bytes.NewReader(encoded)
 	}
-
-	req, err := http.NewRequest(method, url, reader)
+	req, err := http.NewRequest(method, s.server.URL+path, reader)
 	if err != nil {
 		t.Fatalf("http.NewRequest() error = %v", err)
 	}
@@ -87,347 +82,518 @@ func doJSON(t *testing.T, method, url string, body any) *http.Response {
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("%s %s error = %v", method, url, err)
+		t.Fatalf("%s %s error = %v", method, path, err)
 	}
 	t.Cleanup(func() { resp.Body.Close() })
 	return resp
 }
 
-func decodeBody[T any](t *testing.T, resp *http.Response) T {
+func decodeInto[T any](t *testing.T, resp *http.Response) T {
 	t.Helper()
 
 	var out T
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		t.Fatalf("decode body error = %v", err)
+		t.Fatalf("decode error = %v", err)
 	}
 	return out
 }
 
-func TestHealth(t *testing.T) {
-	srv := newTestServer(t, &stubInvoker{})
+func errorCode(t *testing.T, resp *http.Response) string {
+	t.Helper()
+	return decodeInto[errorResponse](t, resp).Error
+}
 
-	resp := doJSON(t, http.MethodGet, srv.URL+"/healthz", nil)
+func endpointBody(url string) map[string]any {
+	return map[string]any{
+		"service": "inventory",
+		"action":  "stock.prehold",
+		"url":     url,
+	}
+}
+
+func TestHealth(t *testing.T) {
+	stack := newTestStack(t, &recordingInvoker{})
+
+	resp := stack.do(t, http.MethodGet, "/healthz", nil)
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("GET /healthz status = %d, want 200", resp.StatusCode)
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	if got := resp.Header.Get("Content-Type"); got != "application/json; charset=utf-8" {
-		t.Errorf("Content-Type = %q, want application/json; charset=utf-8", got)
-	}
-	if body := decodeBody[map[string]string](t, resp); body["status"] != "ok" {
+	if body := decodeInto[map[string]string](t, resp); body["status"] != "ok" {
 		t.Errorf("body = %v, want status ok", body)
 	}
 }
 
-func TestRegisterAndListCallback(t *testing.T) {
-	srv := newTestServer(t, &stubInvoker{})
+func TestRegisterEndpoint(t *testing.T) {
+	stack := newTestStack(t, &recordingInvoker{})
 
-	resp := doJSON(t, http.MethodPost, srv.URL+"/api/v1/callbacks", map[string]any{
-		"topic":   "order.created",
-		"url":     "https://billing.example.com/hooks",
-		"secret":  "s3cr3t",
-		"timeout": "3s",
-	})
+	body := endpointBody("https://inv.example.com/prehold")
+	body["method"] = "POST"
+	body["headers"] = []map[string]string{{"name": "X-Token", "value": "{{ .secret }}"}}
+	body["body"] = `{"order":"{{ .order.id }}"}`
+	body["timeout"] = "4s"
+	body["max_attempts"] = 5
+
+	resp := stack.do(t, http.MethodPost, "/api/v1/endpoints", body)
 	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("POST /api/v1/callbacks status = %d, want 201: %s", resp.StatusCode, readAll(t, resp))
+		t.Fatalf("status = %d, want 201", resp.StatusCode)
 	}
 
-	created := decodeBody[callback.Callback](t, resp)
-	if created.ID == "" {
-		t.Error("registered callback has no ID")
+	ep := decodeInto[notify.Endpoint](t, resp)
+	if ep.Topic() != "inventory.stock.prehold" {
+		t.Errorf("Topic() = %q, want inventory.stock.prehold", ep.Topic())
 	}
-	if created.Topic != "order.created" {
-		t.Errorf("Topic = %q, want order.created", created.Topic)
+	if ep.Timeout != 4*time.Second {
+		t.Errorf("Timeout = %v, want 4s", ep.Timeout)
 	}
-	if created.Timeout != 3*time.Second {
-		t.Errorf("Timeout = %v, want 3s", created.Timeout)
+	if ep.MaxAttempts != 5 {
+		t.Errorf("MaxAttempts = %d, want 5", ep.MaxAttempts)
 	}
-	if created.CreatedAt.IsZero() {
-		t.Error("CreatedAt is zero, want a timestamp")
-	}
-
-	list := doJSON(t, http.MethodGet, srv.URL+"/api/v1/callbacks", nil)
-	if list.StatusCode != http.StatusOK {
-		t.Fatalf("GET /api/v1/callbacks status = %d, want 200", list.StatusCode)
-	}
-	body := decodeBody[struct {
-		Callbacks []callback.Callback `json:"callbacks"`
-		Count     int                 `json:"count"`
-	}](t, list)
-	if body.Count != 1 || len(body.Callbacks) != 1 {
-		t.Fatalf("list body = %+v, want exactly one callback", body)
-	}
-	if body.Callbacks[0].ID != created.ID {
-		t.Errorf("listed ID = %q, want %q", body.Callbacks[0].ID, created.ID)
+	if ep.ID == "" {
+		t.Error("ID is empty")
 	}
 }
 
-func TestListCallbacksFilteredByTopic(t *testing.T) {
-	srv := newTestServer(t, &stubInvoker{})
+func TestRegisterEndpointRejectsBadInput(t *testing.T) {
+	stack := newTestStack(t, &recordingInvoker{})
 
-	doJSON(t, http.MethodPost, srv.URL+"/api/v1/callbacks", map[string]any{
-		"topic": "order.created", "url": "https://a.example.com/hooks",
-	})
-	doJSON(t, http.MethodPost, srv.URL+"/api/v1/callbacks", map[string]any{
-		"topic": "order.paid", "url": "https://b.example.com/hooks",
-	})
-
-	resp := doJSON(t, http.MethodGet, srv.URL+"/api/v1/callbacks?topic=order.paid", nil)
-	body := decodeBody[struct {
-		Callbacks []callback.Callback `json:"callbacks"`
-		Count     int                 `json:"count"`
-	}](t, resp)
-	if body.Count != 1 {
-		t.Fatalf("count = %d, want 1", body.Count)
-	}
-	if body.Callbacks[0].Topic != "order.paid" {
-		t.Errorf("topic = %q, want order.paid", body.Callbacks[0].Topic)
-	}
-}
-
-func TestRegisterCallbackValidation(t *testing.T) {
-	srv := newTestServer(t, &stubInvoker{})
-
+	// Failures raised while reading or converting the request are reported as
+	// invalid_request; failures raised by the registry's own validation, such
+	// as a template that cannot work, are invalid_registration.
 	tests := []struct {
 		name string
-		body any
-		want int
+		body map[string]any
+		want string
 	}{
-		{"missing topic", map[string]any{"url": "https://a.example.com/hooks"}, http.StatusBadRequest},
-		{"missing url", map[string]any{"topic": "order.created"}, http.StatusBadRequest},
-		{"non http url", map[string]any{"topic": "order.created", "url": "ftp://a.example.com/hooks"}, http.StatusBadRequest},
-		{"bad timeout", map[string]any{"topic": "order.created", "url": "https://a.example.com/hooks", "timeout": "soon"}, http.StatusBadRequest},
-		{"negative timeout", map[string]any{"topic": "order.created", "url": "https://a.example.com/hooks", "timeout": "-1s"}, http.StatusBadRequest},
-		{"unknown field", map[string]any{"topic": "order.created", "url": "https://a.example.com/hooks", "nope": true}, http.StatusBadRequest},
+		{"no topic", map[string]any{"url": "https://inv.example.com/h"}, "invalid_registration"},
+		{"bad url scheme", map[string]any{"service": "s", "action": "a", "url": "ftp://inv/h"}, "invalid_registration"},
+		{"bad method", map[string]any{"service": "s", "action": "a", "url": "https://inv/h", "method": "GET"}, "invalid_registration"},
+		{"bad template", map[string]any{"service": "s", "action": "a", "url": "https://inv/{{ .order.id "}, "invalid_registration"},
+		{"bad duration", map[string]any{"service": "s", "action": "a", "url": "https://inv/h", "timeout": "soon"}, "invalid_request"},
+		{"unknown field", map[string]any{"service": "s", "action": "a", "url": "https://inv/h", "surprise": 1}, "invalid_request"},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			resp := doJSON(t, http.MethodPost, srv.URL+"/api/v1/callbacks", tc.body)
-			if resp.StatusCode != tc.want {
-				t.Fatalf("status = %d, want %d: %s", resp.StatusCode, tc.want, readAll(t, resp))
+			resp := stack.do(t, http.MethodPost, "/api/v1/endpoints", tc.body)
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", resp.StatusCode)
 			}
-			if code := decodeBody[errorResponse](t, resp).Error; code != "invalid_request" {
-				t.Errorf("error code = %q, want invalid_request", code)
+			if code := errorCode(t, resp); code != tc.want {
+				t.Errorf("error code = %q, want %q", code, tc.want)
 			}
 		})
 	}
 }
 
-func TestRegisterCallbackRejectsMalformedJSON(t *testing.T) {
-	srv := newTestServer(t, &stubInvoker{})
+func TestRegisterEndpointRejectsEmptyBody(t *testing.T) {
+	stack := newTestStack(t, &recordingInvoker{})
 
-	resp, err := http.Post(srv.URL+"/api/v1/callbacks", "application/json", bytes.NewReader([]byte("{")))
+	resp, err := http.Post(stack.server.URL+"/api/v1/endpoints", "application/json", bytes.NewReader(nil))
 	if err != nil {
 		t.Fatalf("POST error = %v", err)
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for an empty body", resp.StatusCode)
+	}
+}
+
+func TestRegisterEndpointNamesTheBadField(t *testing.T) {
+	stack := newTestStack(t, &recordingInvoker{})
+
+	resp := stack.do(t, http.MethodPost, "/api/v1/endpoints", map[string]any{
+		"service": "s", "action": "a", "url": "https://inv/h", "timeout": "nope",
+	})
+	body := decodeInto[errorResponse](t, resp)
+	if !bytes.Contains([]byte(body.Message), []byte("timeout")) {
+		t.Errorf("message = %q, want it to name the timeout field", body.Message)
+	}
+}
+
+func TestListAndDeleteEndpoints(t *testing.T) {
+	stack := newTestStack(t, &recordingInvoker{})
+
+	if resp := stack.do(t, http.MethodPost, "/api/v1/endpoints", endpointBody("https://inv/prehold")); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("register status = %d, want 201", resp.StatusCode)
+	}
+
+	list := stack.do(t, http.MethodGet, "/api/v1/endpoints", nil)
+	listed := decodeInto[struct {
+		Endpoints []notify.Endpoint `json:"endpoints"`
+		Count     int               `json:"count"`
+	}](t, list)
+	if listed.Count != 1 || len(listed.Endpoints) != 1 {
+		t.Fatalf("list = %+v, want one endpoint", listed)
+	}
+
+	del := stack.do(t, http.MethodDelete, "/api/v1/endpoints/inventory.stock.prehold", nil)
+	if del.StatusCode != http.StatusOK {
+		t.Errorf("delete status = %d, want 200", del.StatusCode)
+	}
+
+	after := stack.do(t, http.MethodGet, "/api/v1/endpoints", nil)
+	if got := decodeInto[struct {
+		Count int `json:"count"`
+	}](t, after); got.Count != 0 {
+		t.Errorf("count after delete = %d, want 0", got.Count)
+	}
+
+	missing := stack.do(t, http.MethodDelete, "/api/v1/endpoints/inventory.stock.prehold", nil)
+	if missing.StatusCode != http.StatusNotFound {
+		t.Errorf("second delete status = %d, want 404", missing.StatusCode)
+	}
+}
+
+func TestSubmitOrderWithDefaultPreset(t *testing.T) {
+	stack := newTestStack(t, &recordingInvoker{})
+
+	resp := stack.do(t, http.MethodPost, "/api/v1/orders", map[string]any{
+		"external_ref": "ref-1",
+		"subject":      "user-9",
+	})
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", resp.StatusCode)
+	}
+
+	o := decodeInto[order.Order](t, resp)
+	if o.Preset != order.PresetOrder {
+		t.Errorf("Preset = %q, want the standard order by default", o.Preset)
+	}
+	if len(o.Steps) != len(order.StandardSteps()) {
+		t.Errorf("len(Steps) = %d, want %d", len(o.Steps), len(order.StandardSteps()))
+	}
+	if o.ID == "" {
+		t.Error("ID is empty")
+	}
+}
+
+func TestSubmitOrderWithNamedPreset(t *testing.T) {
+	stack := newTestStack(t, &recordingInvoker{})
+
+	resp := stack.do(t, http.MethodPost, "/api/v1/orders", map[string]any{
+		"preset":  order.PresetContactUpdate,
+		"subject": "user-9",
+	})
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", resp.StatusCode)
+	}
+
+	o := decodeInto[order.Order](t, resp)
+	if o.Preset != order.PresetContactUpdate {
+		t.Errorf("Preset = %q, want %q", o.Preset, order.PresetContactUpdate)
+	}
+	if len(o.Steps) != 1 || o.Steps[0].Spec.Topic != order.TopicContactUpdate {
+		t.Errorf("steps = %+v, want a single CRM notification", o.Steps)
+	}
+}
+
+func TestSubmitOrderWithCustomSteps(t *testing.T) {
+	stack := newTestStack(t, &recordingInvoker{})
+
+	resp := stack.do(t, http.MethodPost, "/api/v1/orders", map[string]any{
+		"id":      "ord_custom",
+		"payload": map[string]any{"channel": "app"},
+		"steps": []map[string]any{
+			{"name": "first", "topic": "ads.registration", "kind": "notify"},
+			{"name": "second", "topic": "crm.contact.update", "kind": "callback", "depends_on": []string{"first"}},
+		},
+	})
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", resp.StatusCode)
+	}
+
+	o := decodeInto[order.Order](t, resp)
+	if o.ID != "ord_custom" {
+		t.Errorf("ID = %q, want ord_custom", o.ID)
+	}
+	if len(o.Steps) != 2 {
+		t.Fatalf("len(Steps) = %d, want 2", len(o.Steps))
+	}
+	if o.Steps[1].Spec.Kind != order.KindCallback {
+		t.Errorf("second step kind = %q, want callback", o.Steps[1].Spec.Kind)
+	}
+	if o.Steps[0].TaskKey != "ord_custom/first" {
+		t.Errorf("TaskKey = %q, want ord_custom/first", o.Steps[0].TaskKey)
+	}
+}
+
+func TestSubmitOrderValidation(t *testing.T) {
+	stack := newTestStack(t, &recordingInvoker{})
+
+	tests := []struct {
+		name string
+		body map[string]any
+		want int
+	}{
+		{"unknown preset", map[string]any{"preset": "nope"}, http.StatusBadRequest},
+		{"step without a name", map[string]any{
+			"steps": []map[string]any{{"topic": "a.b"}},
+		}, http.StatusBadRequest},
+		{"step with a bad kind", map[string]any{
+			"steps": []map[string]any{{"name": "s", "topic": "a.b", "kind": "magic"}},
+		}, http.StatusBadRequest},
+		{"step with a bad phase", map[string]any{
+			"steps": []map[string]any{{"name": "s", "topic": "a.b", "phase": "ship"}},
+		}, http.StatusBadRequest},
+		{"step without a topic", map[string]any{
+			"steps": []map[string]any{{"name": "s"}},
+		}, http.StatusBadRequest},
+		{"dependency on an unknown step", map[string]any{
+			"steps": []map[string]any{{"name": "s", "topic": "a.b", "depends_on": []string{"ghost"}}},
+		}, http.StatusBadRequest},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := stack.do(t, http.MethodPost, "/api/v1/orders", tc.body)
+			if resp.StatusCode != tc.want {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.want)
+			}
+		})
+	}
+}
+
+func TestSubmitDuplicateOrderIsConflict(t *testing.T) {
+	stack := newTestStack(t, &recordingInvoker{})
+
+	body := map[string]any{"id": "ord_dup", "steps": []map[string]any{{"name": "s", "topic": "a.b"}}}
+	if resp := stack.do(t, http.MethodPost, "/api/v1/orders", body); resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("first submit status = %d, want 202", resp.StatusCode)
+	}
+
+	resp := stack.do(t, http.MethodPost, "/api/v1/orders", body)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", resp.StatusCode)
+	}
+	if code := errorCode(t, resp); code != "conflict" {
+		t.Errorf("error code = %q, want conflict", code)
+	}
+}
+
+func TestGetAndListOrders(t *testing.T) {
+	stack := newTestStack(t, &recordingInvoker{})
+
+	if resp := stack.do(t, http.MethodPost, "/api/v1/orders", map[string]any{
+		"id":    "ord_1",
+		"steps": []map[string]any{{"name": "s", "topic": "a.b"}},
+	}); resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("submit status = %d, want 202", resp.StatusCode)
+	}
+
+	got := stack.do(t, http.MethodGet, "/api/v1/orders/ord_1", nil)
+	if got.StatusCode != http.StatusOK {
+		t.Fatalf("get status = %d, want 200", got.StatusCode)
+	}
+	if o := decodeInto[order.Order](t, got); o.ID != "ord_1" {
+		t.Errorf("ID = %q, want ord_1", o.ID)
+	}
+
+	missing := stack.do(t, http.MethodGet, "/api/v1/orders/ghost", nil)
+	if missing.StatusCode != http.StatusNotFound {
+		t.Errorf("get(ghost) status = %d, want 404", missing.StatusCode)
+	}
+
+	list := stack.do(t, http.MethodGet, "/api/v1/orders", nil)
+	if got := decodeInto[struct {
+		Count int `json:"count"`
+	}](t, list); got.Count != 1 {
+		t.Errorf("count = %d, want 1", got.Count)
+	}
+}
+
+func TestListOrdersFilteredByState(t *testing.T) {
+	stack := newTestStack(t, &recordingInvoker{})
+
+	// A working endpoint, so the order settles into a known terminal state.
+	if resp := stack.do(t, http.MethodPost, "/api/v1/endpoints", map[string]any{
+		"service": "svc", "action": "act", "url": "https://svc/act",
+	}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("register status = %d, want 201", resp.StatusCode)
+	}
+
+	if resp := stack.do(t, http.MethodPost, "/api/v1/orders", map[string]any{
+		"id":    "ord_1",
+		"steps": []map[string]any{{"name": "s", "topic": "svc.act"}},
+	}); resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("submit status = %d, want 202", resp.StatusCode)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if o, err := stack.engine.Get("ord_1"); err == nil && o.State == order.OrderSucceeded {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// Filtering is what makes the list usable as a work queue: only the orders
+	// that still need attention.
+	succeeded := stack.do(t, http.MethodGet, "/api/v1/orders?state=succeeded", nil)
+	if got := decodeInto[struct {
+		Count int `json:"count"`
+	}](t, succeeded); got.Count != 1 {
+		t.Errorf("succeeded count = %d, want 1", got.Count)
+	}
+
+	failed := stack.do(t, http.MethodGet, "/api/v1/orders?state=failed", nil)
+	if got := decodeInto[struct {
+		Count int `json:"count"`
+	}](t, failed); got.Count != 0 {
+		t.Errorf("failed count = %d, want 0", got.Count)
+	}
+
+	unfiltered := stack.do(t, http.MethodGet, "/api/v1/orders", nil)
+	if got := decodeInto[struct {
+		Count int `json:"count"`
+	}](t, unfiltered); got.Count != 1 {
+		t.Errorf("unfiltered count = %d, want 1", got.Count)
+	}
+}
+
+func TestSubmitResult(t *testing.T) {
+	stack := newTestStack(t, &recordingInvoker{})
+
+	// The step only waits for a result if something is registered to receive
+	// the notification.
+	if resp := stack.do(t, http.MethodPost, "/api/v1/endpoints", map[string]any{
+		"service": "svc", "action": "act", "url": "https://svc/act",
+		"result_timeout": "30s",
+	}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("register status = %d, want 201", resp.StatusCode)
+	}
+
+	if resp := stack.do(t, http.MethodPost, "/api/v1/orders", map[string]any{
+		"id":    "ord_1",
+		"steps": []map[string]any{{"name": "s", "topic": "svc.act", "kind": "callback"}},
+	}); resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("submit status = %d, want 202", resp.StatusCode)
+	}
+
+	var deliveryID string
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		o, err := stack.engine.Get("ord_1")
+		if err != nil {
+			t.Fatalf("Get() error = %v", err)
+		}
+		s, _ := o.Step("s")
+		if s.State == order.StateWaiting {
+			deliveryID = s.PendingDeliveryID
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if deliveryID == "" {
+		t.Fatal("the step never waited for a result")
+	}
+
+	resp := stack.do(t, http.MethodPost, "/api/v1/orders/ord_1/steps/s/result", map[string]any{
+		"delivery_id": deliveryID,
+		"success":     true,
+		"data":        map[string]any{"reserved": 2},
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if o := decodeInto[order.Order](t, resp); o.State != order.OrderSucceeded {
+		t.Errorf("State = %q, want succeeded", o.State)
+	}
+}
+
+func TestSubmitResultRequiresDeliveryID(t *testing.T) {
+	stack := newTestStack(t, &recordingInvoker{})
+
+	resp := stack.do(t, http.MethodPost, "/api/v1/orders/ord_1/steps/s/result", map[string]any{
+		"success": true,
+	})
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", resp.StatusCode)
 	}
 }
 
-func TestDeleteCallback(t *testing.T) {
-	srv := newTestServer(t, &stubInvoker{})
+func TestSubmitResultForUnknownOrder(t *testing.T) {
+	stack := newTestStack(t, &recordingInvoker{})
 
-	created := decodeBody[callback.Callback](t, doJSON(t, http.MethodPost, srv.URL+"/api/v1/callbacks", map[string]any{
-		"topic": "order.created", "url": "https://a.example.com/hooks",
-	}))
-
-	resp := doJSON(t, http.MethodDelete, srv.URL+"/api/v1/callbacks/"+created.ID, nil)
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("DELETE status = %d, want 204: %s", resp.StatusCode, readAll(t, resp))
-	}
-	if body, _ := io.ReadAll(resp.Body); len(body) != 0 {
-		t.Errorf("DELETE body = %q, want it empty", body)
-	}
-
-	again := doJSON(t, http.MethodDelete, srv.URL+"/api/v1/callbacks/"+created.ID, nil)
-	if again.StatusCode != http.StatusNotFound {
-		t.Errorf("second DELETE status = %d, want 404", again.StatusCode)
-	}
-}
-
-func TestDeleteUnknownCallback(t *testing.T) {
-	srv := newTestServer(t, &stubInvoker{})
-
-	resp := doJSON(t, http.MethodDelete, srv.URL+"/api/v1/callbacks/does-not-exist", nil)
+	resp := stack.do(t, http.MethodPost, "/api/v1/orders/ghost/steps/s/result", map[string]any{
+		"delivery_id": "d", "success": true,
+	})
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", resp.StatusCode)
 	}
 }
 
-func TestHandleEventInvokesRegisteredCallbacks(t *testing.T) {
-	inv := &stubInvoker{failFor: map[string]error{}}
-	srv := newTestServer(t, inv)
+func TestStatsAndEscalations(t *testing.T) {
+	stack := newTestStack(t, &recordingInvoker{})
 
-	a := decodeBody[callback.Callback](t, doJSON(t, http.MethodPost, srv.URL+"/api/v1/callbacks", map[string]any{
-		"topic": "order.created", "url": "https://a.example.com/hooks",
-	}))
-	b := decodeBody[callback.Callback](t, doJSON(t, http.MethodPost, srv.URL+"/api/v1/callbacks", map[string]any{
-		"topic": "order.created", "url": "https://b.example.com/hooks",
-	}))
-	doJSON(t, http.MethodPost, srv.URL+"/api/v1/callbacks", map[string]any{
-		"topic": "order.paid", "url": "https://c.example.com/hooks",
-	})
-
-	payload := map[string]any{"id": "order-1", "total": 4200}
-	resp := doJSON(t, http.MethodPost, srv.URL+"/api/v1/events/order.created", payload)
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("POST /api/v1/events/order.created status = %d, want 202: %s", resp.StatusCode, readAll(t, resp))
+	if resp := stack.do(t, http.MethodPost, "/api/v1/endpoints", endpointBody("https://inv/prehold")); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("register status = %d, want 201", resp.StatusCode)
+	}
+	if resp := stack.do(t, http.MethodPost, "/api/v1/orders", map[string]any{
+		"id":    "ord_1",
+		"steps": []map[string]any{{"name": "s", "topic": "inventory.stock.prehold"}},
+	}); resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("submit status = %d, want 202", resp.StatusCode)
 	}
 
-	res := decodeBody[callback.Result](t, resp)
-	if res.Topic != "order.created" {
-		t.Errorf("Topic = %q, want order.created", res.Topic)
-	}
-	if res.Delivered != 2 || res.Failed != 0 {
-		t.Errorf("result = delivered:%d failed:%d, want 2/0", res.Delivered, res.Failed)
-	}
-	if res.DeliveryID == "" {
-		t.Error("DeliveryID is empty, want a generated id")
-	}
-
-	got := inv.ids()
-	if len(got) != 2 {
-		t.Fatalf("invoked %d callbacks (%v), want 2", len(got), got)
-	}
-	for _, want := range []string{a.ID, b.ID} {
-		found := false
-		for _, id := range got {
-			if id == want {
-				found = true
-			}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(stack.stats.Snapshot()) > 0 {
+			break
 		}
-		if !found {
-			t.Errorf("callback %q was not invoked (invoked %v)", want, got)
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	stats := stack.do(t, http.MethodGet, "/api/v1/stats", nil)
+	body := decodeInto[struct {
+		Topics []statsResponse `json:"topics"`
+		Count  int             `json:"count"`
+	}](t, stats)
+	if body.Count == 0 {
+		t.Fatal("no statistics were recorded for a completed delivery")
+	}
+	if body.Topics[0].Topic != "inventory.stock.prehold" {
+		t.Errorf("topic = %q, want inventory.stock.prehold", body.Topics[0].Topic)
+	}
+	if body.Topics[0].Delivered == 0 {
+		t.Error("Delivered = 0, want at least one acknowledged delivery")
+	}
+
+	esc := stack.do(t, http.MethodGet, "/api/v1/escalations", nil)
+	if got := decodeInto[struct {
+		Count int `json:"count"`
+	}](t, esc); got.Count != 0 {
+		t.Errorf("escalations = %d, want 0 for a healthy run", got.Count)
+	}
+}
+
+func TestListPresets(t *testing.T) {
+	stack := newTestStack(t, &recordingInvoker{})
+
+	resp := stack.do(t, http.MethodGet, "/api/v1/presets", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	body := decodeInto[struct {
+		Presets []presetView `json:"presets"`
+		Count   int          `json:"count"`
+	}](t, resp)
+	if body.Count != len(order.ListPresets()) {
+		t.Errorf("count = %d, want %d", body.Count, len(order.ListPresets()))
+	}
+	for _, p := range body.Presets {
+		if p.Name == "" || len(p.Steps) == 0 {
+			t.Errorf("preset %+v is incomplete", p)
 		}
 	}
 }
 
-func TestHandleEventWithoutSubscribersStillAccepts(t *testing.T) {
-	srv := newTestServer(t, &stubInvoker{})
+func TestMethodNotAllowed(t *testing.T) {
+	stack := newTestStack(t, &recordingInvoker{})
 
-	resp := doJSON(t, http.MethodPost, srv.URL+"/api/v1/events/order.created", map[string]any{"id": "order-1"})
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("status = %d, want 202", resp.StatusCode)
-	}
-	res := decodeBody[callback.Result](t, resp)
-	if res.Delivered != 0 || len(res.Deliveries) != 0 {
-		t.Errorf("result = %+v, want no deliveries", res)
-	}
-}
-
-func TestHandleEventReportsDeliveryFailureInBody(t *testing.T) {
-	srv := newTestServer(t, &stubInvoker{failFor: map[string]error{}})
-
-	cb := decodeBody[callback.Callback](t, doJSON(t, http.MethodPost, srv.URL+"/api/v1/callbacks", map[string]any{
-		"topic": "order.created", "url": "https://a.example.com/hooks",
-	}))
-
-	inv, ok := srv.dispatcherInvoker()
-	if !ok {
-		t.Fatal("could not reach the stub invoker")
-	}
-	inv.failFor[cb.ID] = context.DeadlineExceeded
-
-	resp := doJSON(t, http.MethodPost, srv.URL+"/api/v1/events/order.created", map[string]any{"id": "order-1"})
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("status = %d, want 202: a failing callback must not fail the publisher", resp.StatusCode)
-	}
-	res := decodeBody[callback.Result](t, resp)
-	if res.Failed != 1 || res.Delivered != 0 {
-		t.Errorf("result = failed:%d delivered:%d, want 1/0", res.Failed, res.Delivered)
-	}
-	if res.Deliveries[0].Error == "" {
-		t.Error("failed delivery has no error message")
-	}
-}
-
-func TestHandleEventRejectsBadPayloads(t *testing.T) {
-	srv := newTestServer(t, &stubInvoker{})
-
-	tests := []struct {
-		name string
-		body string
-	}{
-		{"empty body", ""},
-		{"whitespace body", "   \n "},
-		{"invalid json", "{not json"},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			req, err := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/events/order.created", bytes.NewReader([]byte(tc.body)))
-			if err != nil {
-				t.Fatalf("http.NewRequest() error = %v", err)
-			}
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				t.Fatalf("POST error = %v", err)
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode != http.StatusBadRequest {
-				t.Errorf("status = %d, want 400", resp.StatusCode)
-			}
-		})
-	}
-}
-
-func TestHandleEventRejectsOversizedBody(t *testing.T) {
-	registry := callback.NewMemoryRegistry()
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	dispatcher := callback.NewDispatcher(registry, &stubInvoker{}, time.Second, 4, logger)
-
-	srv := httptest.NewServer(NewRouter(Dependencies{
-		Registry:     registry,
-		Dispatcher:   dispatcher,
-		Logger:       logger,
-		MaxBodyBytes: 64,
-	}))
-	defer srv.Close()
-
-	body, err := json.Marshal(map[string]string{"pad": string(make([]byte, 256))})
-	if err != nil {
-		t.Fatalf("json.Marshal() error = %v", err)
-	}
-
-	req, err := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/events/order.created", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("http.NewRequest() error = %v", err)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("POST error = %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("status = %d, want 400 for a body above MaxBodyBytes", resp.StatusCode)
-	}
-}
-
-func TestMethodAndRouteNotAllowed(t *testing.T) {
-	srv := newTestServer(t, &stubInvoker{})
-
-	resp := doJSON(t, http.MethodGet, srv.URL+"/api/v1/events/order.created", nil)
+	resp := stack.do(t, http.MethodGet, "/api/v1/orders/ord_1/steps/s/result", nil)
 	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Errorf("GET on the event route status = %d, want 405", resp.StatusCode)
+		t.Errorf("status = %d, want 405", resp.StatusCode)
 	}
-}
-
-func readAll(t *testing.T, resp *http.Response) string {
-	t.Helper()
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("io.ReadAll() error = %v", err)
-	}
-	return string(b)
-}
-
-// dispatcherInvoker exposes the stub invoker used by the test server.
-func (ts *testServer) dispatcherInvoker() (*stubInvoker, bool) {
-	inv, ok := ts.invoker.(*stubInvoker)
-	return inv, ok
 }
