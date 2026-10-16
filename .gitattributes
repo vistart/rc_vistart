@@ -1,0 +1,20 @@
+# Normalise line endings in the repository so that a Windows checkout and a
+# Linux checkout produce identical bytes. This matters for the Makefile, which
+# breaks when its tab-indented recipes arrive with CRLF.
+
+* text=auto
+
+*.go   text eol=lf
+*.md   text eol=lf
+Makefile text eol=lf
+go.mod text eol=lf
+go.sum text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+
+# Binary-ish files that must never be touched.
+LICENSE  text eol=lf
+*.out   binary
+*.exe   binary
+*.png   binary
+*.svg   binary

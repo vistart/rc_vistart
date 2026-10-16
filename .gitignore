@@ -1,0 +1,21 @@
+# Build output
+/bin/
+/dist/
+rc_vistart
+rc_vistart.exe
+
+# Test and coverage output
+*.test
+*.out
+coverage.html
+
+# Environment
+.env
+.env.local
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
